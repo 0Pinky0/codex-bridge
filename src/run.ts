@@ -7,7 +7,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import type { PendingInteraction } from "./interaction.js";
+import type { InteractionPolicy, PendingInteraction } from "./interaction.js";
 
 /**
  * Run state model and durable event log.
@@ -53,12 +53,27 @@ export interface RunRecord {
   model: string | null;
   sandbox: string | null;
   approvalPolicy: string | null;
+  /**
+   * Per-kind interaction policy for this run, layered over the daemon default.
+   * Persisted so that `status` shows what a run was actually dispatched under:
+   * an auto-approved exec is only auditable if the policy that approved it is
+   * recorded alongside the event that used it.
+   */
+  policy: InteractionPolicy;
   createdAtMs: number;
   updatedAtMs: number;
   /** Final assistant message, populated on completion. */
   finalMessage: string | null;
   /** Populated on `failed`. */
   error: string | null;
+  /**
+   * Set when a write to this run's event log or snapshot failed.
+   *
+   * A run whose log cannot be written is degraded even if the turn itself is
+   * fine: the transcript now has a hole in it. Saying so beats presenting a
+   * short log as a complete one.
+   */
+  storeError: string | null;
   /** Outstanding server requests awaiting a human answer. */
   pending: PendingInteraction[];
   /** Monotonic count of events appended, so clients can poll incrementally. */
@@ -76,10 +91,12 @@ export function newRunRecord(runId: string, cwd: string): RunRecord {
     model: null,
     sandbox: null,
     approvalPolicy: null,
+    policy: {},
     createdAtMs: now,
     updatedAtMs: now,
     finalMessage: null,
     error: null,
+    storeError: null,
     pending: [],
     eventCount: 0,
   };
@@ -122,7 +139,13 @@ export class RunStore {
     const path = join(this.runDir(runId), "record.json");
     if (!existsSync(path)) return null;
     try {
-      return JSON.parse(readFileSync(path, "utf8")) as RunRecord;
+      const record = JSON.parse(readFileSync(path, "utf8")) as RunRecord;
+      // Records written by an older build predate `policy`. Backfilling the
+      // safe default here beats letting `undefined` reach the classifier, where
+      // it would read as "no policy set" only by accident.
+      record.policy ??= {};
+      record.storeError ??= null;
+      return record;
     } catch {
       return null;
     }

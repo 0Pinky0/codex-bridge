@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { fileURLToPath } from "node:url";
-import { BridgeClient } from "./client.js";
+import { BridgeClient, BridgeRequestError } from "./client.js";
 import { BridgeDaemon, defaultHome, defaultSocketPath } from "./daemon.js";
+import { parsePolicySpecs, POLICY_KINDS, POLICY_MODES, type InteractionPolicy, type PolicyMode } from "./interaction.js";
 import { EXIT, exitCodeForRun, summarize } from "./outcome.js";
 import type { RunRecord } from "./run.js";
 
@@ -10,13 +11,17 @@ export { EXIT } from "./outcome.js";
 interface ParsedArgs {
   command: string;
   positional: string[];
+  /** Last occurrence wins, which is what a scalar flag should mean. */
   flags: Record<string, string | boolean>;
+  /** Every occurrence, in order, for flags like `--policy` that repeat. */
+  repeated: Record<string, string[]>;
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
   const [command = "help", ...rest] = argv;
   const positional: string[] = [];
   const flags: Record<string, string | boolean> = {};
+  const repeated: Record<string, string[]> = {};
   for (let i = 0; i < rest.length; i += 1) {
     const token = rest[i]!;
     if (!token.startsWith("--")) {
@@ -29,10 +34,30 @@ function parseArgs(argv: string[]): ParsedArgs {
       flags[key] = true;
     } else {
       flags[key] = next;
+      (repeated[key] ??= []).push(next);
       i += 1;
     }
   }
-  return { command, positional, flags };
+  return { command, positional, flags, repeated };
+}
+
+/**
+ * Build the per-run interaction policy from `--policy kind=mode` (repeatable)
+ * and the `--auto-approve` / `--auto-deny` blanket switches.
+ *
+ * A bad spec exits with the usage code rather than starting a run under a
+ * policy the caller did not write.
+ */
+function policyFromFlags(args: ParsedArgs): InteractionPolicy {
+  const approve = Boolean(args.flags["auto-approve"]);
+  const deny = Boolean(args.flags["auto-deny"]);
+  if (approve && deny) fail("--auto-approve and --auto-deny contradict each other");
+  const blanket: PolicyMode | undefined = approve ? "approve" : deny ? "deny" : undefined;
+  try {
+    return parsePolicySpecs(args.repeated["policy"] ?? [], blanket);
+  } catch (error) {
+    return fail(error instanceof Error ? error.message : String(error));
+  }
 }
 
 function print(value: unknown): void {
@@ -47,9 +72,19 @@ function fail(message: string, code: number = EXIT.USAGE): never {
 const ENTRYPOINT = fileURLToPath(import.meta.url);
 
 async function main(): Promise<void> {
-  const { command, positional, flags } = parseArgs(process.argv.slice(2));
+  const args = parseArgs(process.argv.slice(2));
+  const { command, positional, flags } = args;
   const socketPath = typeof flags["socket"] === "string" ? flags["socket"] : defaultSocketPath();
   const client = new BridgeClient(socketPath);
+
+  /** Wait on a run and exit with the code that describes what happened. */
+  const waitAndExit = async (runId: string): Promise<never> => {
+    const timeoutMs = Number(flags["timeout"] ?? 240000);
+    const record = (await client.send({ op: "wait", runId, timeoutMs }, timeoutMs + 30000)) as RunRecord;
+    print(record);
+    process.stderr.write(summarize(record) + "\n");
+    process.exit(exitCodeForRun(record));
+  };
 
   switch (command) {
     case "daemon": {
@@ -83,6 +118,7 @@ async function main(): Promise<void> {
       const cwd = typeof flags["cwd"] === "string" ? flags["cwd"] : process.cwd();
       const prompt = typeof flags["prompt"] === "string" ? flags["prompt"] : positional.join(" ");
       if (!prompt.trim()) fail("dispatch requires --prompt");
+      const policy = policyFromFlags(args);
       await client.ensureDaemon(ENTRYPOINT);
       const result = (await client.send({
         op: "dispatch",
@@ -93,21 +129,50 @@ async function main(): Promise<void> {
         sandbox: flags["sandbox"] ?? null,
         approvalPolicy: flags["approval"] ?? null,
         developerInstructions: flags["instructions"] ?? null,
+        policy,
       })) as { runId: string };
 
       if (!flags["wait"]) {
         print(result);
         return;
       }
-      const timeoutMs = Number(flags["timeout"] ?? 240000);
-      const record = (await client.send(
-        { op: "wait", runId: result.runId, timeoutMs },
-        timeoutMs + 30000,
-      )) as RunRecord;
-      print(record);
-      process.stderr.write(summarize(record) + "\n");
-      process.exit(exitCodeForRun(record));
+      await waitAndExit(result.runId);
       return;
+    }
+
+    case "resume": {
+      const runId = positional[0];
+      if (!runId) fail("resume requires a run id");
+      const prompt = typeof flags["prompt"] === "string" ? flags["prompt"] : positional.slice(1).join(" ");
+      if (!prompt.trim()) fail("resume requires --prompt");
+      const policy = policyFromFlags(args);
+      await client.ensureDaemon(ENTRYPOINT);
+      const result = (await client.send({
+        op: "resume",
+        runId,
+        prompt,
+        cwd: flags["cwd"] ?? null,
+        model: flags["model"] ?? null,
+        effort: flags["effort"] ?? null,
+        newRun: Boolean(flags["new-run"]),
+        policy,
+      })) as { runId: string };
+
+      if (!flags["wait"]) {
+        print(result);
+        return;
+      }
+      // Resuming with --new-run reports under the new id, not the one asked for.
+      await waitAndExit(result.runId);
+      return;
+    }
+
+    case "mcp": {
+      // Stdio is the MCP transport, so nothing may write to stdout but the
+      // protocol itself; the server module keeps diagnostics on stderr.
+      const { serveMcpStdio } = await import("./mcp.js");
+      await serveMcpStdio({ client, entrypoint: ENTRYPOINT });
+      return; // Run until the client closes the transport.
     }
 
     case "status": {
@@ -123,11 +188,7 @@ async function main(): Promise<void> {
     case "wait": {
       const runId = positional[0];
       if (!runId) fail("wait requires a run id");
-      const timeoutMs = Number(flags["timeout"] ?? 240000);
-      const record = (await client.send({ op: "wait", runId, timeoutMs }, timeoutMs + 30000)) as RunRecord;
-      print(record);
-      process.stderr.write(summarize(record) + "\n");
-      process.exit(exitCodeForRun(record));
+      await waitAndExit(runId);
       return;
     }
 
@@ -187,12 +248,19 @@ async function main(): Promise<void> {
           "  daemon [start|stop|status|--foreground]",
           "  dispatch --cwd <dir> --prompt <text> [--wait] [--timeout ms]",
           "           [--model m] [--effort e] [--sandbox s] [--approval p]",
+          "           [--policy kind=mode]... [--auto-approve | --auto-deny]",
+          "  resume <runId> --prompt <text> [--new-run] [--wait] [--timeout ms]",
+          "                 [--cwd d] [--model m] [--effort e] [--policy kind=mode]...",
           "  status <runId>",
           "  wait <runId> [--timeout ms]",
           "  answer <runId> --request <id> --answer <value|json>",
           "  interrupt <runId>",
           "  list",
           "  events <runId> [--since n] [--limit n]",
+          "  mcp                       serve the bridge as an MCP server over stdio",
+          "",
+          `Policy kinds: ${POLICY_KINDS.join(", ")}`,
+          `Policy modes: ${POLICY_MODES.join(", ")} (default: ask)`,
           "",
           "Exit codes: 0 completed, 10 BLOCKED (needs a human), 11 still running,",
           "            12 failed, 13 interrupted, 14 daemon unreachable.",
@@ -208,5 +276,9 @@ async function main(): Promise<void> {
 
 main().catch((error: unknown) => {
   process.stderr.write(`codex-bridge: ${error instanceof Error ? error.message : String(error)}\n`);
-  process.exit(EXIT.UNREACHABLE);
+  // A daemon that answered and refused is not a daemon that could not be
+  // reached. Reporting both as 14 would send a caller chasing a socket problem
+  // that does not exist.
+  const unreachable = !(error instanceof BridgeRequestError) || error.unreachable;
+  process.exit(unreachable ? EXIT.UNREACHABLE : EXIT.USAGE);
 });

@@ -3,6 +3,22 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { defaultSocketPath } from "./daemon.js";
 
+/**
+ * A control-request failure, tagged with whether the daemon could be reached.
+ *
+ * The distinction is load-bearing: "the daemon is not there" and "the daemon
+ * refused what you asked" are different problems with different fixes, and
+ * collapsing them would report a rejected `resume` as infrastructure trouble.
+ */
+export class BridgeRequestError extends Error {
+  readonly unreachable: boolean;
+  constructor(message: string, unreachable: boolean) {
+    super(message);
+    this.name = "BridgeRequestError";
+    this.unreachable = unreachable;
+  }
+}
+
 /** Transient client for the bridge daemon's control socket. */
 export class BridgeClient {
   #socketPath: string;
@@ -37,15 +53,28 @@ export class BridgeClient {
       };
 
       const timer = setTimeout(
-        () => finish(new Error(`control request '${String(request["op"])}' timed out after ${timeoutMs}ms`)),
+        () =>
+          finish(
+            new BridgeRequestError(
+              `control request '${String(request["op"])}' timed out after ${timeoutMs}ms`,
+              true,
+            ),
+          ),
         timeoutMs,
       );
 
       socket.setEncoding("utf8");
       socket.on("error", (error) =>
-        finish(new Error(`cannot reach codex-bridge daemon at ${this.#socketPath}: ${error.message}`)),
+        finish(
+          new BridgeRequestError(
+            `cannot reach codex-bridge daemon at ${this.#socketPath}: ${error.message}`,
+            true,
+          ),
+        ),
       );
-      socket.on("close", () => finish(new Error("daemon closed the connection without responding")));
+      socket.on("close", () =>
+        finish(new BridgeRequestError("daemon closed the connection without responding", true)),
+      );
       socket.on("connect", () => socket.write(JSON.stringify(request) + "\n"));
       socket.on("data", (chunk: string) => {
         buffer += chunk;
@@ -55,11 +84,13 @@ export class BridgeClient {
         try {
           response = JSON.parse(buffer.slice(0, index)) as Record<string, unknown>;
         } catch {
-          finish(new Error("daemon returned malformed JSON"));
+          finish(new BridgeRequestError("daemon returned malformed JSON", true));
           return;
         }
         if (response["ok"]) finish(null, response["result"]);
-        else finish(new Error(String(response["error"] ?? "unknown daemon error")));
+        // The daemon answered; it just said no. That is the caller's problem to
+        // fix, not the transport's.
+        else finish(new BridgeRequestError(String(response["error"] ?? "unknown daemon error"), false));
       });
     });
   }

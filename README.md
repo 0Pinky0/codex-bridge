@@ -60,22 +60,106 @@ node dist/cli.js help
 
 Requires Node ≥ 20 and the `codex` CLI on `PATH` (verified against 0.152.0).
 
+Runtime dependencies are `@modelcontextprotocol/sdk` and `zod`, both used only
+by the `mcp` command. Nothing on the CLI or daemon path imports them, so the
+core bridge still runs on the standard library alone.
+
 ## Usage
 
 ```sh
 codex-bridge daemon start
 codex-bridge dispatch --cwd /repo --prompt '...' [--wait] [--timeout ms]
                       [--model m] [--effort e] [--sandbox s] [--approval p]
+                      [--policy kind=mode]... [--auto-approve | --auto-deny]
+codex-bridge resume <runId> --prompt '...' [--new-run] [--wait] [--timeout ms]
+                            [--cwd d] [--model m] [--effort e] [--policy kind=mode]...
 codex-bridge status <runId>
 codex-bridge wait <runId> [--timeout ms]
 codex-bridge answer <runId> --request <id> --answer <value|json>
 codex-bridge interrupt <runId>
 codex-bridge list
 codex-bridge events <runId> [--since n] [--limit n]
+codex-bridge mcp
 ```
 
 `--sandbox` is `read-only` | `workspace-write` | `danger-full-access`.
 `--approval` is `untrusted` | `on-request` | `never`.
+
+### Interaction policy
+
+By default every inbound request is parked and waits for a human — a bridge
+whose whole point is surfacing questions must not answer them by accident.
+`--policy kind=mode` opts specific kinds out of that, and repeats:
+
+```sh
+codex-bridge dispatch --cwd /repo --prompt 'run the tests' --wait \
+  --policy exec=approve --policy fileChange=deny
+```
+
+| | values |
+| --- | --- |
+| kinds | `exec`, `patch`, `fileChange`, `permissions`, `userInput`, `elicitation`, `toolCall` |
+| modes | `ask` (default, parks), `approve`, `deny` |
+
+`--auto-approve` and `--auto-deny` set every kind at once and can still be
+overridden per kind — `--auto-approve --policy fileChange=ask` approves
+everything but patches. The two blanket switches contradict each other and are
+rejected together.
+
+`approve` cannot manufacture authority the bridge does not have: `permissions`
+and `toolCall` requests still park under `--auto-approve`, because a permission
+grant and a dynamic tool result have no answer that can be synthesized honestly.
+A misspelled kind or mode is a **usage error (exit 2) before any run is
+created** — never a silently ignored flag that leaves a run under a policy the
+caller did not write. The effective policy is stored on the run record, so an
+auto-approved exec is auditable next to the `bridge/autoAnswered` event that
+used it.
+
+### Resuming
+
+`resume` sends another turn on a finished run's thread and rebuilds the live
+record around it. The thread id is read from the persisted snapshot, so this
+works after a daemon restart, a reboot, or a run the daemon has never seen in
+this process:
+
+```sh
+codex-bridge resume run-mtn7uc8l-40pzr9 --prompt 'now update the tests' --wait
+codex-bridge resume run-mtn7uc8l-40pzr9 --prompt 'try again' --new-run --wait
+```
+
+Without `--new-run` the continuation stays under the original runId and the
+event log grows append-only across the resume. With `--new-run` the
+continuation gets a fresh runId carrying a `bridge/resumedFrom` event, and the
+original record — which holds the evidence of *why* a resume was needed — is
+left untouched.
+
+A run that is still `blocked` or `running` is refused rather than resumed. A
+second turn on a live thread would orphan the parked approval that made the run
+interesting in the first place; answer it or interrupt it first.
+
+### MCP server
+
+`codex-bridge mcp` serves the bridge over stdio as an MCP server, exposing
+`codex_dispatch`, `codex_resume`, `codex_status`, `codex_wait`, `codex_answer`,
+`codex_interrupt`, `codex_list`, and `codex_events`.
+
+```json
+{ "command": "node", "args": ["/path/to/codex-bridge/dist/cli.js", "mcp"] }
+```
+
+A model has no exit code to read, so the blocked/completed distinction is
+carried twice on every run-shaped result: the first line of text is the same
+summary the CLI prints (which never describes a blocked run in words that read
+as success), and `structuredContent.needsHuman` is a boolean to branch on. Both
+are always present, so a caller reading only the prose and one reading only the
+structure reach the same conclusion.
+
+`codex_wait` is **bounded** — 60s by default, 240s maximum. When the window
+elapses before the run settles, the result says the run has *not* finished, sets
+`timedOut: true` and `exitCode: 11`, and tells the caller to call again. A wait
+that ran until the MCP client's own timeout would surface as a transport error
+instead of a run state, losing exactly the information the tool exists to
+report.
 
 ### Exit codes are the contract
 
@@ -92,6 +176,10 @@ codex-bridge events <runId> [--since n] [--limit n]
 A caller that only checks for exit 0 still will not mistake a blocked run for a
 finished one. A caller that reads the code learns exactly what happened without
 parsing prose.
+
+A daemon that answered and *refused* exits 2, not 14. "The daemon is gone" and
+"the daemon said no" are different problems with different fixes, and collapsing
+them would send a caller chasing a socket failure that never happened.
 
 ### Answering a parked request
 
@@ -133,6 +221,20 @@ The snapshot is written *after* the log, so a crash mid-write leaves the log
 ahead of the snapshot rather than the reverse. A snapshot must never claim more
 progress than the log can substantiate.
 
+On startup the daemon reconciles runs that a previous daemon left non-terminal.
+A `running` record with no process behind it is a lie, so it is marked `failed`
+with a `bridge/orphaned` event and an error that names the state it died in and
+the exact `codex-bridge resume` command that picks the work back up — the
+resume-blocking bookkeeping is repaired rather than described.
+
+A failed write to a run's log or snapshot degrades that one run instead of
+taking down the daemon: the reason is recorded on the record's `storeError` and
+echoed to stderr. These writes happen inside the transport's data handler, where
+an unguarded throw escapes as an uncaught exception and kills every unrelated
+run along with it — the precise durability failure this daemon exists to
+prevent. A hole in a transcript is reported, never presented as a short but
+complete log.
+
 ### Transport
 
 Only `codex app-server --stdio` is used, with newline-delimited JSON framing.
@@ -172,6 +274,10 @@ create user namespaces.
 - Interrupting a run answers every parked request with a decline *before*
   interrupting, so the server side is never left waiting on a client that has
   already walked away.
+- An interrupted turn is reported as `interrupted` (exit 13), not flattened into
+  `failed` (exit 12). The protocol has a first-class `interrupted` turn status;
+  reporting it as a failure would send a caller hunting for an error that does
+  not exist.
 
 ## Environment
 
@@ -193,12 +299,27 @@ regeneration.
 
 ## Status
 
+Feature-complete against its original scope: the MCP server surface,
+`thread/resume` on the CLI, and per-kind policy flags all landed.
+
 Verified end to end against `codex` 0.152.0 on Linux:
 
 - happy path — `dispatch --wait` returned `completed`, exit 0
 - blocked path — an approval request parked the run, `wait` returned `blocked`
   with exit **10** and the pending question surfaced; `answer --answer accept`
   released it and the run completed with exit 0
+- policy — the same prompt under `--policy exec=approve` completed without ever
+  parking; `--policy exce=approve` exited 2 with the valid-kinds list before a
+  daemon was even started
+- resume — `resume --prompt` kept the thread's context; `resume --new-run` after
+  a full `daemon stop` produced a fresh runId on the same thread and left the
+  original record intact; `resume` on a blocked run was refused
 
-`npm run ci` is green (35 tests). Not yet implemented: the MCP server surface,
-`thread/resume` wired to the CLI, and per-kind policy flags on `dispatch`.
+`npm run ci` is green (75 tests). Beyond the unit tests, `test/bridge.test.js`
+drives the real control socket against a scripted App Server stand-in
+(`test/fixtures/fake-app-server.mjs`), because the behaviours that matter here —
+a parked request, a resume across a daemon restart, a run orphaned by a dead
+daemon — only exist in the seam between the daemon, the store, and a peer that
+sends requests back. Three bugs were found that way and fixed: an interrupted
+turn reported as `failed`, a daemon refusal reported as an unreachable daemon,
+and an unguarded event-log write that could kill the daemon.

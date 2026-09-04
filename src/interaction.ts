@@ -34,6 +34,84 @@ export type PolicyMode = "ask" | "approve" | "deny";
 /** Per-kind policy. Anything unset defaults to `ask`, which is the safe default. */
 export type InteractionPolicy = Partial<Record<InteractionKind, PolicyMode>>;
 
+/**
+ * The kinds a caller may set a policy for.
+ *
+ * `internal` is deliberately absent: auth refresh and attestation are host
+ * application plumbing that this bridge cannot satisfy at any policy setting,
+ * so offering a knob for them would advertise a capability that does not exist.
+ */
+export const POLICY_KINDS = [
+  "exec",
+  "patch",
+  "fileChange",
+  "permissions",
+  "userInput",
+  "elicitation",
+  "toolCall",
+] as const satisfies readonly InteractionKind[];
+
+export const POLICY_MODES = ["ask", "approve", "deny"] as const satisfies readonly PolicyMode[];
+
+function isPolicyKind(value: string): value is (typeof POLICY_KINDS)[number] {
+  return (POLICY_KINDS as readonly string[]).includes(value);
+}
+
+function isPolicyMode(value: string): value is PolicyMode {
+  return (POLICY_MODES as readonly string[]).includes(value);
+}
+
+/**
+ * Validate a policy that arrived from outside the process (a CLI flag, an MCP
+ * tool argument, a persisted record).
+ *
+ * A misspelled kind is rejected rather than ignored. Silently dropping
+ * `--policy exce=approve` would leave the caller believing they had configured
+ * something, and the first they would learn otherwise is a run parked on a
+ * question they thought they had pre-answered.
+ */
+export function sanitizePolicy(value: unknown): InteractionPolicy {
+  if (value === undefined || value === null) return {};
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`policy must be an object mapping kind to mode, got ${JSON.stringify(value)}`);
+  }
+  const policy: InteractionPolicy = {};
+  for (const [kind, mode] of Object.entries(value as Record<string, unknown>)) {
+    if (!isPolicyKind(kind)) {
+      throw new Error(`unknown interaction kind '${kind}'; valid kinds: ${POLICY_KINDS.join(", ")}`);
+    }
+    if (typeof mode !== "string" || !isPolicyMode(mode)) {
+      throw new Error(
+        `unknown policy mode '${String(mode)}' for '${kind}'; valid modes: ${POLICY_MODES.join(", ")}`,
+      );
+    }
+    policy[kind] = mode;
+  }
+  return policy;
+}
+
+/**
+ * Parse repeated `--policy kind=mode` specs, layered over an optional blanket
+ * mode from `--auto-approve` / `--auto-deny`.
+ *
+ * Per-kind specs win over the blanket, so `--auto-approve --policy exec=ask`
+ * means what it reads like. Nothing here can produce a policy for `internal`.
+ */
+export function parsePolicySpecs(specs: readonly string[], blanket?: PolicyMode): InteractionPolicy {
+  const policy: InteractionPolicy = {};
+  if (blanket) {
+    for (const kind of POLICY_KINDS) policy[kind] = blanket;
+  }
+  for (const spec of specs) {
+    const index = spec.indexOf("=");
+    if (index <= 0) {
+      throw new Error(`--policy expects kind=mode, got '${spec}'; valid kinds: ${POLICY_KINDS.join(", ")}`);
+    }
+    Object.assign(policy, sanitizePolicy({ [spec.slice(0, index)]: spec.slice(index + 1) }));
+  }
+  return policy;
+}
+
 export const SERVER_REQUEST_KINDS: Record<string, InteractionKind> = {
   "execCommandApproval": "exec",
   "item/commandExecution/requestApproval": "exec",

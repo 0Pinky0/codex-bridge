@@ -8,10 +8,11 @@ import {
   buildAnswerResponse,
   classifyServerRequest,
   declineResponse,
+  sanitizePolicy,
   type InteractionPolicy,
   type PendingInteraction,
 } from "./interaction.js";
-import { isTerminal, newRunRecord, RunStore, type RunRecord, type RunState } from "./run.js";
+import { isTerminal, newRunRecord, RunStore, type RunEvent, type RunRecord, type RunState } from "./run.js";
 
 /**
  * The bridge daemon.
@@ -95,6 +96,8 @@ export class BridgeDaemon {
     this.#appServer = this.#spawnAppServer();
     await this.#appServer.initialize();
 
+    this.#reconcileOrphanedRuns();
+
     this.#server.on("connection", (socket) => this.#handleConnection(socket));
     await new Promise<void>((resolve, reject) => {
       this.#server.once("error", reject);
@@ -106,6 +109,35 @@ export class BridgeDaemon {
       socketPath: this.#socketPath,
       startedAtMs: this.#startedAtMs,
     }, null, 2) + "\n", "utf8");
+  }
+
+  /**
+   * On startup, close out runs left non-terminal by a previous daemon.
+   *
+   * A bridge home is owned by one daemon at a time -- `start()` refuses to run
+   * beside a live one -- so a `running` or `blocked` record on disk at this
+   * moment has no process behind it and never will. Leaving it alone is the
+   * stale-bookkeeping failure this tool was written against: `wait` would hang
+   * on a turn nobody is driving, and `status` would report progress that
+   * stopped hours ago. Marking it `failed` says what actually happened, and the
+   * thread id survives in the record so `resume` can pick the work back up.
+   */
+  #reconcileOrphanedRuns(): void {
+    for (const record of this.#store.list()) {
+      if (isTerminal(record.state)) continue;
+      const previousState = record.state;
+      record.state = "failed";
+      record.pending = [];
+      record.error =
+        `orphaned: the daemon that owned this run exited while it was '${previousState}'` +
+        (record.threadId ? `; resume it with: codex-bridge resume ${record.runId} --prompt <text>` : "");
+      this.#store.appendEvent(record, {
+        atMs: Date.now(),
+        method: "bridge/orphaned",
+        params: { previousState },
+      });
+      this.#store.save(record);
+    }
   }
 
   #spawnAppServer(): AppServer {
@@ -140,7 +172,7 @@ export class BridgeDaemon {
     const live = threadId ? this.#liveByThread(threadId) : null;
     if (!live) return;
 
-    this.#store.appendEvent(live.record, { atMs: Date.now(), method, params });
+    this.#record(live, { atMs: Date.now(), method, params });
 
     switch (method) {
       case "turn/started": {
@@ -155,6 +187,11 @@ export class BridgeDaemon {
         const finalMessage = extractFinalMessage(turn);
         if (status === "completed") {
           this.#transition(live, "completed", { finalMessage });
+        } else if (status === "interrupted" || live.record.state === "interrupted") {
+          // `interrupted` is a first-class TurnStatus, and it is not a failure:
+          // reporting a user's own stop as `failed` would send them hunting for
+          // an error that does not exist, and would exit 12 instead of 13.
+          this.#transition(live, "interrupted", { finalMessage });
         } else {
           this.#transition(live, "failed", {
             finalMessage,
@@ -178,7 +215,10 @@ export class BridgeDaemon {
     const threadId = typeof record?.["threadId"] === "string" ? (record["threadId"] as string) : null;
     const live = threadId ? this.#liveByThread(threadId) : null;
 
-    const disposition = classifyServerRequest(method, params, id, this.#policy);
+    // The run's own policy is layered over the daemon default, so a `dispatch`
+    // that pre-approved one kind does not leak that decision into other runs.
+    const policy = live ? { ...this.#policy, ...live.record.policy } : this.#policy;
+    const disposition = classifyServerRequest(method, params, id, policy);
 
     if (!live) {
       // An unroutable request still gets an answer. Dropping it would hang the
@@ -187,10 +227,10 @@ export class BridgeDaemon {
       throw new Error(`codex-bridge could not route '${method}' to a known run`);
     }
 
-    this.#store.appendEvent(live.record, { atMs: Date.now(), method: `serverRequest/${method}`, params });
+    this.#record(live, { atMs: Date.now(), method: `serverRequest/${method}`, params });
 
     if (disposition.type === "unsupported") {
-      this.#store.appendEvent(live.record, {
+      this.#record(live, {
         atMs: Date.now(),
         method: "bridge/unsupportedServerRequest",
         params: { method, message: disposition.message },
@@ -199,7 +239,7 @@ export class BridgeDaemon {
     }
 
     if (disposition.type === "auto") {
-      this.#store.appendEvent(live.record, {
+      this.#record(live, {
         atMs: Date.now(),
         method: "bridge/autoAnswered",
         params: { method, note: disposition.note },
@@ -223,13 +263,37 @@ export class BridgeDaemon {
     if (patch.finalMessage !== undefined) live.record.finalMessage = patch.finalMessage;
     if (patch.error !== undefined) live.record.error = patch.error;
     if (state !== "blocked") live.record.pending = [...live.parked.values()].map((e) => e.pending);
-    this.#store.appendEvent(live.record, { atMs: Date.now(), method: "bridge/state", params: { state } });
+    this.#record(live, { atMs: Date.now(), method: "bridge/state", params: { state } });
     this.#save(live);
     this.#wake(live);
   }
 
   #save(live: LiveRun): void {
-    this.#store.save(live.record);
+    this.#guardStore(live, "snapshot", () => this.#store.save(live.record));
+  }
+
+  /**
+   * Append to a run's event log without letting the write take the daemon down.
+   *
+   * `appendEvent` runs inside the transport's data handler, so an unguarded
+   * throw -- a removed run directory, a full disk -- escapes as an uncaught
+   * exception and kills the process, taking every unrelated run with it. That
+   * is a strictly worse outcome than a hole in one log. The hole is recorded on
+   * the run and reported on stderr rather than swallowed, because a silently
+   * short transcript is one that reads as complete.
+   */
+  #record(live: LiveRun, event: RunEvent): void {
+    this.#guardStore(live, `event ${event.method}`, () => this.#store.appendEvent(live.record, event));
+  }
+
+  #guardStore(live: LiveRun | null, label: string, write: () => void): void {
+    try {
+      write();
+    } catch (error) {
+      const message = `store write failed (${label}): ${error instanceof Error ? error.message : String(error)}`;
+      if (live) live.record.storeError = message;
+      process.stderr.write(`codex-bridge: ${message}\n`);
+    }
   }
 
   /**
@@ -250,7 +314,7 @@ export class BridgeDaemon {
 
   #broadcastBridgeEvent(method: string, params: unknown): void {
     for (const live of this.#runs.values()) {
-      this.#store.appendEvent(live.record, { atMs: Date.now(), method, params });
+      this.#record(live, { atMs: Date.now(), method, params });
     }
   }
 
@@ -305,6 +369,8 @@ export class BridgeDaemon {
         };
       case "dispatch":
         return this.#opDispatch(request);
+      case "resume":
+        return this.#opResume(request);
       case "status":
         return this.#requireRecord(String(request["runId"] ?? ""));
       case "list":
@@ -338,12 +404,16 @@ export class BridgeDaemon {
     if (!existsSync(cwd)) throw new Error(`cwd does not exist: ${cwd}`);
     const prompt = String(request["prompt"] ?? "");
     if (!prompt.trim()) throw new Error("dispatch requires a non-empty prompt");
+    // Validate before anything is persisted: a run started under a policy the
+    // caller mistyped is worse than a run that never started.
+    const policy = sanitizePolicy(request["policy"]);
 
     const runId = `run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     const record = newRunRecord(runId, cwd);
     record.model = (request["model"] as string) ?? null;
     record.sandbox = (request["sandbox"] as string) ?? null;
     record.approvalPolicy = (request["approvalPolicy"] as string) ?? null;
+    record.policy = policy;
     this.#store.create(record);
 
     const live: LiveRun = { record, parked: new Map(), waiters: [] };
@@ -372,6 +442,104 @@ export class BridgeDaemon {
     this.#save(live);
 
     return { runId, threadId, turnId };
+  }
+
+  /**
+   * Resume a previous thread and send it another turn.
+   *
+   * This is what makes a run survive the daemon, not just the terminal. The
+   * thread id is read back from the persisted record, so a run dispatched
+   * before a daemon restart -- and therefore absent from `#runs` -- is still
+   * resumable. Requiring it to be live would reintroduce exactly the
+   * "the work is gone because the supervisor died" failure the store exists to
+   * prevent.
+   */
+  async #opResume(request: Record<string, unknown>): Promise<unknown> {
+    const appServer = this.#appServer;
+    if (!appServer) throw new Error("app-server is not running; restart the daemon");
+
+    const runId = String(request["runId"] ?? "");
+    const source = this.#requireRecord(runId);
+    if (!source.threadId) {
+      throw new Error(`run '${runId}' never started a thread; there is nothing to resume`);
+    }
+
+    const existing = this.#runs.get(runId);
+    if (existing && !isTerminal(existing.record.state)) {
+      // Resuming over a live turn would start a second turn on the same thread
+      // and orphan whatever the first one was waiting for.
+      const hint =
+        existing.record.state === "blocked"
+          ? "answer its pending requests or interrupt it"
+          : "wait for it or interrupt it";
+      throw new Error(`run '${runId}' is ${existing.record.state}; ${hint} before resuming`);
+    }
+
+    const prompt = String(request["prompt"] ?? "");
+    if (!prompt.trim()) throw new Error("resume requires a non-empty prompt");
+    const cwd = String(request["cwd"] ?? source.cwd);
+    if (!existsSync(cwd)) throw new Error(`cwd does not exist: ${cwd}`);
+    const policy = sanitizePolicy(request["policy"]);
+
+    const threadId = source.threadId;
+    const asNewRun = Boolean(request["newRun"]);
+
+    let record: RunRecord;
+    let live: LiveRun;
+    if (asNewRun) {
+      // Keep the old record exactly as it was left. Overwriting the record that
+      // holds a failure or an unanswered question destroys the evidence of why
+      // a resume was needed in the first place.
+      record = newRunRecord(`run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`, cwd);
+      record.threadId = threadId;
+      record.model = (request["model"] as string) ?? source.model;
+      record.sandbox = source.sandbox;
+      record.approvalPolicy = source.approvalPolicy;
+      record.policy = Object.keys(policy).length > 0 ? policy : source.policy;
+      this.#store.create(record);
+      this.#store.appendEvent(record, {
+        atMs: Date.now(),
+        method: "bridge/resumedFrom",
+        params: { runId: source.runId, threadId },
+      });
+      live = { record, parked: new Map(), waiters: [] };
+    } else {
+      record = source;
+      record.cwd = cwd;
+      record.state = "starting";
+      record.finalMessage = null;
+      record.error = null;
+      record.pending = [];
+      record.turnId = null;
+      if (request["model"] !== undefined && request["model"] !== null) record.model = request["model"] as string;
+      if (Object.keys(policy).length > 0) record.policy = policy;
+      live = existing ?? { record, parked: new Map(), waiters: [] };
+      live.record = record;
+    }
+    this.#runs.set(record.runId, live);
+
+    await appServer.resumeThread({ threadId, cwd });
+    // A resumed thread belongs to whichever run is now driving it; otherwise
+    // approvals for this turn would route to the run that finished with it.
+    this.#byThread.set(threadId, record.runId);
+    this.#store.appendEvent(record, {
+      atMs: Date.now(),
+      method: "bridge/threadResumed",
+      params: { threadId, cwd, resumedFrom: source.runId },
+    });
+
+    const { turnId } = await appServer.startTurn({
+      threadId,
+      text: prompt,
+      cwd,
+      model: record.model,
+      effort: (request["effort"] as string) ?? null,
+    });
+    record.turnId = turnId;
+    if (record.state === "starting") record.state = "running";
+    this.#save(live);
+
+    return { runId: record.runId, threadId, turnId, resumedFrom: source.runId };
   }
 
   #requireLive(runId: string): LiveRun {
@@ -422,7 +590,7 @@ export class BridgeDaemon {
     live.parked.delete(key);
     entry.resolve(response);
 
-    this.#store.appendEvent(live.record, {
+    this.#record(live, {
       atMs: Date.now(),
       method: "bridge/answered",
       params: { requestId: key, method: entry.pending.method },
@@ -445,7 +613,7 @@ export class BridgeDaemon {
       try {
         await this.#appServer.interrupt(live.record.threadId, live.record.turnId);
       } catch (error) {
-        this.#store.appendEvent(live.record, {
+        this.#record(live, {
           atMs: Date.now(),
           method: "bridge/interruptFailed",
           params: { message: error instanceof Error ? error.message : String(error) },
@@ -456,10 +624,19 @@ export class BridgeDaemon {
     return { runId, state: live.record.state };
   }
 
-  stop(): void {
+  /**
+   * Release every resource this daemon owns. Kept separate from {@link stop} so
+   * a test -- or any embedder -- can shut a daemon down without taking the
+   * whole process with it.
+   */
+  close(): void {
     this.#appServer?.close();
     this.#server.close();
     rmSync(this.#socketPath, { force: true });
+  }
+
+  stop(): never {
+    this.close();
     process.exit(0);
   }
 }
