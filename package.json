@@ -1,0 +1,24 @@
+{
+  "name": "codex-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Bidirectional bridge to the Codex App Server: durable runs, first-class blocked states, and answerable server requests.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "codex-bridge": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test \"test/**/*.test.js\"",
+    "regen-protocol": "codex app-server generate-ts --out src/protocol && node scripts/fix-protocol-imports.mjs src/protocol",
+    "ci": "npm run typecheck && npm run build && npm test"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.6.0"
+  }
+}
