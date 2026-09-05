@@ -41,6 +41,7 @@ function record(overrides = {}) {
     createdAtMs: 1,
     updatedAtMs: 2,
     finalMessage: null,
+    proseQuestionHint: false,
     error: null,
     pending: [],
     eventCount: 3,
@@ -131,6 +132,19 @@ test("a completed run reports needsHuman false and carries the final message", a
   assert.equal(result.structuredContent.needsHuman, false);
   assert.equal(result.structuredContent.exitCode, 0);
   assert.match(result.content[0].text, /refactor done/);
+  await client.close();
+});
+
+test("a prose-question advisory is structured and textual without fabricating blocked", async () => {
+  const client = await connect(() =>
+    record({ finalMessage: "Please confirm the next step.", proseQuestionHint: true }),
+  );
+  const result = await client.callTool({ name: "codex_status", arguments: { runId: "run-test" } });
+  assert.equal(result.structuredContent.state, "completed");
+  assert.equal(result.structuredContent.needsHuman, false);
+  assert.equal(result.structuredContent.proseQuestionHint, true);
+  assert.equal(result.structuredContent.exitCode, 0);
+  assert.match(result.content[0].text.split("\n")[0], /ADVISORY/);
   await client.close();
 });
 

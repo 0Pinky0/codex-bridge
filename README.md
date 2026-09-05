@@ -162,6 +162,17 @@ as success), and `structuredContent.needsHuman` is a boolean to branch on. Both
 are always present, so a caller reading only the prose and one reading only the
 structure reach the same conclusion.
 
+A completed run can also carry `proseQuestionHint: true`. This is an advisory,
+not a state: it never changes `completed`, `needsHuman`, terminality, or exit
+code 0, because prose has no parked `requestId` that `codex_answer` could
+answer. The explainable heuristic inspects only the final non-empty paragraph
+and flags either a literal `?` or an explicit `please authorize`, `please
+confirm`, `please choose`, `please decide`, `please provide`, `please clarify`,
+`please advise`, `please tell`, or `please select`. It can miss indirect asks,
+questions earlier in a long message, and other languages, and it can flag
+rhetorical or quoted questions. When present, the first-line summary also says
+that the final message may be asking for a response.
+
 `codex_wait` is **bounded** — 60s by default, 240s maximum. When the window
 elapses before the run settles, the result says the run has *not* finished, sets
 `timedOut: true` and `exitCode: 11`, and tells the caller to call again. A wait
@@ -184,6 +195,10 @@ report.
 A caller that only checks for exit 0 still will not mistake a blocked run for a
 finished one. A caller that reads the code learns exactly what happened without
 parsing prose.
+
+The prose-question advisory deliberately has no new exit code. It is uncertain
+and unanswerable through `codex_answer`; changing a completed run's exit status
+would break existing shell callers and blur that protocol distinction.
 
 A daemon that answered and *refused* exits 2, not 14. "The daemon is gone" and
 "the daemon said no" are different problems with different fixes, and collapsing

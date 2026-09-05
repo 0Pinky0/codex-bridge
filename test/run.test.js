@@ -1,9 +1,9 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { RunStore, isTerminal, needsHuman, newRunRecord } from "../dist/run.js";
+import { RunStore, hasProseQuestionHint, isTerminal, needsHuman, newRunRecord } from "../dist/run.js";
 import { EXIT, exitCodeForRun, summarize } from "../dist/outcome.js";
 
 function withStore(fn) {
@@ -69,6 +69,34 @@ test("a failed run's summary carries the real error, not a generic word", () => 
   record.state = "failed";
   record.error = "app-server exited (code=1, signal=null); stderr was empty";
   assert.match(summarize(record), /stderr was empty/);
+});
+
+test("the prose-question advisory catches the captured authority-boundary final message", () => {
+  const fixture = JSON.parse(
+    readFileSync(new URL("./fixtures/prose-question-final-message.json", import.meta.url), "utf8"),
+  );
+  assert.equal(fixture.sourceRunId, "run-mtnh4itc-ye6dd7");
+  assert.equal(hasProseQuestionHint(fixture.finalMessage), true);
+});
+
+test("a prose-question hint stays completed, terminal, non-blocked, and exit 0", () => {
+  const record = newRunRecord("run-advisory", "/tmp");
+  record.state = "completed";
+  record.finalMessage = "Work is complete.\n\nPlease confirm which deployment target to use.";
+  record.proseQuestionHint = hasProseQuestionHint(record.finalMessage);
+
+  assert.equal(record.proseQuestionHint, true);
+  assert.equal(record.state, "completed");
+  assert.equal(needsHuman(record.state), false);
+  assert.equal(isTerminal(record.state), true);
+  assert.equal(exitCodeForRun(record), EXIT.OK);
+  assert.match(summarize(record), /ADVISORY/);
+});
+
+test("the prose-question heuristic is limited to the final paragraph", () => {
+  assert.equal(hasProseQuestionHint("Did the tests pass?\n\nAll work is complete."), false);
+  assert.equal(hasProseQuestionHint("All work is complete."), false);
+  assert.equal(hasProseQuestionHint("All work is complete. What next?"), true);
 });
 
 test("records round-trip through the store", () => {

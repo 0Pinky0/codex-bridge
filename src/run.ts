@@ -18,6 +18,8 @@ import type { InteractionPolicy, PendingInteraction } from "./interaction.js";
  * finished" will sit on a finished-looking run for hours. Any code that maps
  * these two states together is a bug, and `isTerminal()` deliberately excludes
  * `blocked` so that waiters keep waiting on it rather than returning success.
+ * A completed final message can still look like a natural-language question;
+ * that is only an advisory hint because there is no parked request to answer.
  */
 
 export type RunState =
@@ -35,6 +37,21 @@ export function isTerminal(state: RunState): boolean {
 /** States in which a human is required before anything else can happen. */
 export function needsHuman(state: RunState): boolean {
   return state === "blocked";
+}
+
+/**
+ * Modest natural-language heuristic for completed messages that may be asking
+ * the supervisor to respond. Only the final non-empty paragraph is inspected.
+ * It detects a literal `?` or a short list of explicit "please <verb>" requests.
+ * It intentionally does not claim to understand indirect requests, other
+ * languages, or questions earlier in a long final message.
+ */
+export function hasProseQuestionHint(message: string | null): boolean {
+  if (!message?.trim()) return false;
+  const paragraphs = message.trim().split(/\n\s*\n/);
+  const finalParagraph = paragraphs.at(-1) ?? "";
+  if (finalParagraph.includes("?")) return true;
+  return /\bplease\s+(?:authorize|confirm|choose|decide|provide|clarify|advise|tell|select)\b/i.test(finalParagraph);
 }
 
 export interface RunEvent {
@@ -64,6 +81,8 @@ export interface RunRecord {
   updatedAtMs: number;
   /** Final assistant message, populated on completion. */
   finalMessage: string | null;
+  /** Heuristic advisory only; unlike `blocked`, there is no parked request. */
+  proseQuestionHint: boolean;
   /** Populated on `failed`. */
   error: string | null;
   /**
@@ -95,6 +114,7 @@ export function newRunRecord(runId: string, cwd: string): RunRecord {
     createdAtMs: now,
     updatedAtMs: now,
     finalMessage: null,
+    proseQuestionHint: false,
     error: null,
     storeError: null,
     pending: [],
@@ -145,6 +165,8 @@ export class RunStore {
       // it would read as "no policy set" only by accident.
       record.policy ??= {};
       record.storeError ??= null;
+      record.proseQuestionHint ??=
+        record.state === "completed" && hasProseQuestionHint(record.finalMessage);
       return record;
     } catch {
       return null;

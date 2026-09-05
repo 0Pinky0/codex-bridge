@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BridgeClient, BridgeRequestError } from "../dist/client.js";
 import { BridgeDaemon } from "../dist/daemon.js";
-import { RunStore } from "../dist/run.js";
+import { RunStore, needsHuman } from "../dist/run.js";
 import { EXIT, exitCodeForRun } from "../dist/outcome.js";
 
 /**
@@ -138,6 +138,20 @@ test("a dispatched run completes and reports its final message", async () => {
   });
 });
 
+test("the daemon records a prose-question hint without changing completed semantics", async () => {
+  await withHome(async (home) => {
+    await withDaemon(home, async (client) => {
+      const { runId } = await dispatch(client, { prompt: "ok:Please confirm the deployment target." });
+      const record = await client.send({ op: "wait", runId, timeoutMs: 5000 }, 10000);
+      assert.equal(record.state, "completed");
+      assert.equal(record.proseQuestionHint, true);
+      assert.equal(needsHuman(record.state), false);
+      assert.equal(exitCodeForRun(record), EXIT.OK);
+      assert.deepEqual(record.pending, []);
+    });
+  });
+});
+
 test("an approval request parks the run, and an answer releases it", async () => {
   await withHome(async (home) => {
     await withDaemon(home, async (client) => {
@@ -145,6 +159,8 @@ test("an approval request parks the run, and an answer releases it", async () =>
       const blocked = await client.send({ op: "wait", runId, timeoutMs: 5000 }, 10000);
 
       assert.equal(blocked.state, "blocked", "a stop-to-ask must not look like a completion");
+      assert.equal(blocked.proseQuestionHint, false);
+      assert.equal(needsHuman(blocked.state), true);
       assert.equal(exitCodeForRun(blocked), EXIT.BLOCKED);
       assert.equal(blocked.pending.length, 1);
       assert.match(blocked.pending[0].summary, /rm -rf build/);

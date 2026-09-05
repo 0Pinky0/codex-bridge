@@ -12,7 +12,15 @@ import {
   type InteractionPolicy,
   type PendingInteraction,
 } from "./interaction.js";
-import { isTerminal, newRunRecord, RunStore, type RunEvent, type RunRecord, type RunState } from "./run.js";
+import {
+  hasProseQuestionHint,
+  isTerminal,
+  newRunRecord,
+  RunStore,
+  type RunEvent,
+  type RunRecord,
+  type RunState,
+} from "./run.js";
 
 /**
  * The bridge daemon.
@@ -264,6 +272,7 @@ export class BridgeDaemon {
     const previousState = live.record.state;
     live.record.state = state;
     if (patch.finalMessage !== undefined) live.record.finalMessage = patch.finalMessage;
+    live.record.proseQuestionHint = state === "completed" && hasProseQuestionHint(live.record.finalMessage);
     if (patch.error !== undefined) live.record.error = patch.error;
     if (state !== "blocked") live.record.pending = [...live.parked.values()].map((e) => e.pending);
     this.#record(live, { atMs: Date.now(), method: "bridge/state", params: { state } });
@@ -526,6 +535,7 @@ export class BridgeDaemon {
       record.cwd = cwd;
       record.state = "starting";
       record.finalMessage = null;
+      record.proseQuestionHint = false;
       record.error = null;
       record.pending = [];
       record.turnId = null;

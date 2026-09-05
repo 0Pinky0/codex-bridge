@@ -51,7 +51,11 @@ export function summarize(record: RunRecord): string {
       `answer with: codex-bridge answer ${record.runId} --request <id> --answer <value>`,
     ].join("\n");
   }
-  if (record.state === "completed") return `run ${record.runId} completed`;
+  if (record.state === "completed") {
+    return record.proseQuestionHint
+      ? `run ${record.runId} completed (ADVISORY: final message may be asking for a response)`
+      : `run ${record.runId} completed`;
+  }
   if (record.state === "failed") return `run ${record.runId} failed: ${record.error ?? "unknown error"}`;
   if (record.state === "interrupted") return `run ${record.runId} was interrupted`;
   return `run ${record.runId} is ${record.state}`;

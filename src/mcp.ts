@@ -44,6 +44,8 @@ const RUN_OUTPUT_SHAPE = {
   state: z.string(),
   /** True exactly when the run is stopped waiting for a person. */
   needsHuman: z.boolean(),
+  /** Heuristic only: a completed final message may be asking for a response. */
+  proseQuestionHint: z.boolean(),
   /** True when `codex_wait` returned before the run settled. */
   timedOut: z.boolean(),
   /** The exit code the CLI would use, so both surfaces agree. */
@@ -288,6 +290,7 @@ export function createMcpServer(options: McpServerOptions): McpServer {
           runId: record.runId,
           state: record.state,
           needsHuman: needsHuman(record.state),
+          proseQuestionHint: record.proseQuestionHint,
           cwd: record.cwd,
           updatedAtMs: record.updatedAtMs,
           pending: record.pending.map((p) => ({ requestId: p.requestId, kind: p.kind, summary: p.summary })),
