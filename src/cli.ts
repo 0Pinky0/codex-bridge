@@ -89,8 +89,47 @@ async function main(): Promise<void> {
   /** Keep crossing bounded daemon wait windows until the run actually settles. */
   const watchAndExit = async (runId: string): Promise<never> => {
     const timeoutMs = Number(flags["timeout"] ?? 240000);
+    if (flags["retry-unreachable"] !== undefined && typeof flags["retry-unreachable"] !== "string") {
+      fail("--retry-unreachable requires a number of milliseconds");
+    }
+    const retryUnreachableMs = Number(flags["retry-unreachable"] ?? 300000);
+    if (!Number.isFinite(retryUnreachableMs) || retryUnreachableMs < 0) {
+      fail("--retry-unreachable must be a non-negative number of milliseconds");
+    }
+    let unreachableSince: number | null = null;
+    let retryDelayMs = 100;
     for (;;) {
-      const record = (await client.send({ op: "wait", runId, timeoutMs }, timeoutMs + 30000)) as RunRecord;
+      let record: RunRecord;
+      try {
+        const retryRemainingMs = unreachableSince === null
+          ? timeoutMs + 30000
+          : Math.max(1, retryUnreachableMs - (Date.now() - unreachableSince));
+        const requestTimeoutMs = Math.min(timeoutMs + 30000, retryRemainingMs);
+        record = (await client.send({ op: "wait", runId, timeoutMs }, requestTimeoutMs)) as RunRecord;
+        // A response proves the daemon is reachable. A later outage gets its
+        // own bounded retry window, even when this run is watched for hours.
+        unreachableSince = null;
+        retryDelayMs = 100;
+      } catch (error) {
+        if (!(error instanceof BridgeRequestError) || !error.unreachable || retryUnreachableMs === 0) {
+          throw error;
+        }
+        const now = Date.now();
+        unreachableSince ??= now;
+        const elapsedMs = now - unreachableSince;
+        if (elapsedMs >= retryUnreachableMs) {
+          throw new BridgeRequestError(
+            `${error.message}; daemon remained unreachable after retrying for ${elapsedMs}ms ` +
+              `(limit: ${retryUnreachableMs}ms)`,
+            true,
+          );
+        }
+        await new Promise((resolve) =>
+          setTimeout(resolve, Math.min(retryDelayMs, retryUnreachableMs - elapsedMs)),
+        );
+        retryDelayMs = Math.min(retryDelayMs * 2, 1000);
+        continue;
+      }
       if (exitCodeForRun(record) === EXIT.STILL_RUNNING) continue;
       print(record);
       process.stderr.write(summarize(record) + "\n");
@@ -272,7 +311,8 @@ async function main(): Promise<void> {
           "                 [--cwd d] [--model m] [--effort e] [--policy kind=mode]...",
           "  status <runId>",
           "  wait <runId> [--timeout ms]",
-          "  watch <runId> [--timeout ms]   wait across windows until settled",
+          "  watch <runId> [--timeout ms] [--retry-unreachable ms]",
+          "        wait across bounded windows; retry unreachable daemons for 300000ms",
           "  answer <runId> --request <id> --answer <value|json>",
           "  interrupt <runId>",
           "  list",

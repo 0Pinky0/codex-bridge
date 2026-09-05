@@ -75,7 +75,7 @@ codex-bridge resume <runId> --prompt '...' [--new-run] [--wait] [--timeout ms]
                             [--cwd d] [--model m] [--effort e] [--policy kind=mode]...
 codex-bridge status <runId>
 codex-bridge wait <runId> [--timeout ms]
-codex-bridge watch <runId> [--timeout ms]
+codex-bridge watch <runId> [--timeout ms] [--retry-unreachable ms]
 codex-bridge answer <runId> --request <id> --answer <value|json>
 codex-bridge interrupt <runId>
 codex-bridge list
@@ -196,8 +196,15 @@ model to read it. For a reliable process-level wake-up, launch
 `codex-bridge watch <runId>` in the background. `watch` repeatedly crosses the
 daemon's bounded wait windows until the run is completed, blocked, failed, or
 interrupted, then its process exits with the semantic code below. `--timeout`
-sets each bounded window; it is not an overall deadline. An already-settled run
-returns promptly. The existing `wait` and `codex_wait` commands remain bounded.
+sets the size of each bounded daemon wait window; it is not an overall deadline.
+If the daemon becomes unreachable, `watch` alone retries the connection with
+backoff for up to `--retry-unreachable` milliseconds (300000ms by default).
+That retry window measures a continuous outage and resets after any successful
+daemon response. If the window expires, `watch` exits 14 and reports how long it
+retried. Set `--retry-unreachable 0` to restore fail-fast behaviour. This only
+reconnects: `watch` never starts a daemon. An already-settled or unknown run
+returns promptly because a daemon response is never retried. The existing
+`wait` and `codex_wait` commands remain bounded and fail fast on an outage.
 
 ### Exit codes are the contract
 

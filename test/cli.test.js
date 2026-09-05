@@ -83,6 +83,105 @@ test("watch survives a bounded window and exits when the run later settles", asy
   });
 });
 
+test("watch survives daemon stop/start and reports the orphaned run", async () => {
+  const home = mkdtempSync(join(tmpdir(), "cbr-watch-restart-home-"));
+  const socketPath = join(tmpdir(), `cbr-watch-restart-${process.pid}-${Date.now()}.sock`);
+  const env = {
+    ...process.env,
+    CODEX_BRIDGE_HOME: home,
+    CODEX_BRIDGE_SOCKET: socketPath,
+    CODEX_BIN: FAKE_APP_SERVER,
+    FAKE_APP_SERVER_STATE: join(home, "fake-threads.json"),
+  };
+  const daemon = spawn(process.execPath, [CLI, "daemon", "--foreground"], {
+    env,
+    stdio: "ignore",
+  });
+  const client = new BridgeClient(socketPath);
+  try {
+    const deadline = Date.now() + 5000;
+    while (!(await client.isRunning()) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.equal(await client.isRunning(), true, "isolated daemon did not start");
+    const { runId } = await client.send({ op: "dispatch", cwd: process.cwd(), prompt: "hang" });
+    assert.equal((await client.send({ op: "status", runId })).state, "running");
+
+    const watching = runCli([
+      "watch", runId, "--timeout", "1000", "--retry-unreachable", "5000", "--socket", socketPath,
+    ], env);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const stopped = await runCli(["daemon", "stop", "--socket", socketPath], env);
+    assert.equal(stopped.code, EXIT.OK);
+    const daemonExit = await new Promise((resolve) =>
+      daemon.once("close", (code, signal) => resolve({ code, signal })),
+    );
+    assert.deepEqual(daemonExit, { code: EXIT.OK, signal: null });
+
+    const started = await runCli(["daemon", "start", "--socket", socketPath], env);
+    assert.equal(started.code, EXIT.OK, started.stderr);
+    const result = await watching;
+    assert.equal(result.code, EXIT.FAILED, result.stderr);
+    assert.notEqual(result.code, EXIT.UNREACHABLE);
+    const record = JSON.parse(result.stdout);
+    assert.equal(record.state, "failed");
+    assert.match(record.error, /orphaned/);
+    assert.match(record.error, new RegExp(`resume ${runId}`));
+    assert.match(result.stderr, /failed: orphaned/);
+    const events = await client.send({ op: "events", runId, since: 0, limit: 200 });
+    assert.ok(events.some((event) => event.method === "bridge/orphaned"));
+  } finally {
+    if (await client.isRunning()) {
+      await runCli(["daemon", "stop", "--socket", socketPath], env);
+      const deadline = Date.now() + 5000;
+      while (await client.isRunning() && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      assert.equal(await client.isRunning(), false, "restarted test daemon did not stop");
+    }
+    if (daemon.exitCode === null && daemon.signalCode === null) daemon.kill("SIGTERM");
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("watch exits 14 after the unreachable retry window and reports its duration", async () => {
+  const socketPath = join(tmpdir(), `cbr-watch-absent-${process.pid}-${Date.now()}.sock`);
+  const startedAt = Date.now();
+  const result = await runCli([
+    "watch", "run-anything", "--retry-unreachable", "150", "--socket", socketPath,
+  ]);
+  const elapsedMs = Date.now() - startedAt;
+  assert.equal(result.code, EXIT.UNREACHABLE);
+  assert.notEqual(result.code, EXIT.OK);
+  assert.ok(elapsedMs >= 120, `retry ended too early after ${elapsedMs}ms`);
+  assert.match(result.stderr, /after retrying for \d+ms \(limit: 150ms\)/);
+});
+
+test("watch does not retry a daemon refusal for an unknown run", async () => {
+  await withDaemon(async (_client, socketPath) => {
+    const startedAt = Date.now();
+    const result = await runCli([
+      "watch", "run-does-not-exist", "--retry-unreachable", "5000", "--socket", socketPath,
+    ]);
+    const elapsedMs = Date.now() - startedAt;
+    assert.equal(result.code, EXIT.USAGE);
+    assert.match(result.stderr, /unknown run 'run-does-not-exist'/);
+    assert.ok(elapsedMs < 1000, `daemon refusal was not prompt (${elapsedMs}ms)`);
+  });
+});
+
+test("--retry-unreachable 0 restores immediate exit 14", async () => {
+  const socketPath = join(tmpdir(), `cbr-watch-no-retry-${process.pid}-${Date.now()}.sock`);
+  const startedAt = Date.now();
+  const result = await runCli([
+    "watch", "run-anything", "--retry-unreachable", "0", "--socket", socketPath,
+  ]);
+  const elapsedMs = Date.now() - startedAt;
+  assert.equal(result.code, EXIT.UNREACHABLE);
+  assert.ok(elapsedMs < 1000, `disabled retry was not immediate (${elapsedMs}ms)`);
+  assert.doesNotMatch(result.stderr, /after retrying/);
+});
+
 test("daemon stop can explicitly target and clean up a custom socket", async () => {
   const home = mkdtempSync(join(tmpdir(), "cbr-custom-home-"));
   const socketPath = join(tmpdir(), `cbr-custom-${process.pid}-${Date.now()}.sock`);
