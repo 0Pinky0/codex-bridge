@@ -143,6 +143,14 @@ interesting in the first place; answer it or interrupt it first.
 `codex_dispatch`, `codex_resume`, `codex_status`, `codex_wait`, `codex_answer`,
 `codex_interrupt`, `codex_list`, and `codex_events`.
 
+The MCP server also subscribes to the daemon's control socket and emits a
+standard `notifications/message` logging notification whenever a run changes
+state, including when it becomes `blocked` or reaches `completed`, `failed`, or
+`interrupted`. The notification data contains `{ type: "runStateChanged",
+record }`. Delivery is best-effort: disconnected clients miss events, and the
+daemon neither buffers them nor waits for delivery, so a dropped MCP client can
+never delay or damage a run.
+
 ```json
 { "command": "node", "args": ["/path/to/codex-bridge/dist/cli.js", "mcp"] }
 ```

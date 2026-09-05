@@ -2,7 +2,8 @@ import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { createMcpServer } from "../dist/mcp.js";
+import { LoggingMessageNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
+import { createMcpServer, subscribeMcpToRunStates } from "../dist/mcp.js";
 
 /**
  * The MCP surface has no exit codes, so the blocked/completed distinction has
@@ -69,6 +70,31 @@ async function connect(handler) {
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
   return client;
 }
+
+test("daemon state events are forwarded through the SDK logging notification API", async () => {
+  let forward;
+  const inner = fakeClient(() => ({}));
+  inner.subscribe = async (handler) => {
+    forward = handler;
+    return () => {};
+  };
+  const client = new Client({ name: "test", version: "0" });
+  const server = createMcpServer({ client: inner, entrypoint: "/dev/null" });
+  const [a, b] = InMemoryTransport.createLinkedPair();
+  const received = new Promise((resolve) => {
+    client.setNotificationHandler(LoggingMessageNotificationSchema, resolve);
+  });
+  await Promise.all([server.connect(b), client.connect(a)]);
+  await subscribeMcpToRunStates({ client: inner, entrypoint: "/dev/null" }, server);
+
+  forward({ type: "runStateChanged", record: { runId: "run-push", state: "blocked" } });
+  const notification = await received;
+  assert.equal(notification.method, "notifications/message");
+  assert.equal(notification.params.level, "notice");
+  assert.equal(notification.params.data.type, "runStateChanged");
+  assert.equal(notification.params.data.record.state, "blocked");
+  await client.close();
+});
 
 test("every bridge operation is reachable as a tool", async () => {
   const client = await connect(() => ({}));

@@ -56,6 +56,76 @@ function withHome(fn) {
 const dispatch = (client, extra = {}) =>
   client.send({ op: "dispatch", cwd: process.cwd(), prompt: "ok:done", ...extra });
 
+async function waitForNotification(notifications, runId, state) {
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    const found = notifications.find((event) => event.record.runId === runId && event.record.state === state);
+    if (found) return found;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.fail(`no ${state} notification arrived for ${runId}`);
+}
+
+test("state transitions to blocked and completed are pushed to subscribers", async () => {
+  await withHome(async (home) => {
+    await withDaemon(home, async (client) => {
+      const notifications = [];
+      const unsubscribe = await client.subscribe((event) => notifications.push(event));
+      try {
+        const { runId } = await dispatch(client, { prompt: "approve:touch marker" });
+        const blocked = await waitForNotification(notifications, runId, "blocked");
+        assert.equal(blocked.type, "runStateChanged");
+        assert.equal(blocked.record.pending.length, 1);
+
+        await client.send({
+          op: "answer",
+          runId,
+          requestId: String(blocked.record.pending[0].requestId),
+          answer: "accept",
+        });
+        await waitForNotification(notifications, runId, "completed");
+      } finally {
+        unsubscribe();
+      }
+    });
+  });
+});
+
+test("transitions to every terminal state are pushed to subscribers", async () => {
+  for (const scenario of [
+    { state: "completed", prompt: "ok:done" },
+    { state: "interrupted", prompt: "hang", interrupt: true },
+    { state: "failed", prompt: "crash" },
+  ]) {
+    await withHome(async (home) => {
+      await withDaemon(home, async (client) => {
+        const notifications = [];
+        const unsubscribe = await client.subscribe((event) => notifications.push(event));
+        try {
+          const { runId } = await dispatch(client, { prompt: scenario.prompt });
+          if (scenario.interrupt) await client.send({ op: "interrupt", runId });
+          const event = await waitForNotification(notifications, runId, scenario.state);
+          assert.equal(event.record.state, scenario.state);
+        } finally {
+          unsubscribe();
+        }
+      });
+    });
+  }
+});
+
+test("a run completes and the daemon keeps serving when no notification client is listening", async () => {
+  await withHome(async (home) => {
+    await withDaemon(home, async (client) => {
+      const { runId } = await dispatch(client, { prompt: "ok:unobserved but durable" });
+      const record = await client.send({ op: "wait", runId, timeoutMs: 5000 }, 10000);
+      assert.equal(record.state, "completed");
+      assert.equal(record.finalMessage, "unobserved but durable");
+      assert.equal((await client.send({ op: "ping" })).appServerAlive, true);
+    });
+  });
+});
+
 test("a dispatched run completes and reports its final message", async () => {
   await withHome(async (home) => {
     await withDaemon(home, async (client) => {

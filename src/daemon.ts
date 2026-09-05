@@ -71,6 +71,8 @@ export class BridgeDaemon {
   #byThread = new Map<string, string>();
   #startedAtMs = Date.now();
   #server = createServer();
+  /** Disposable listeners; no run ever waits for delivery or acknowledgement. */
+  #subscribers = new Set<Socket>();
 
   constructor(options: DaemonOptions = {}) {
     this.#store = new RunStore(options.home ?? defaultHome());
@@ -259,6 +261,7 @@ export class BridgeDaemon {
   // ------------------------------------------------------------ transitions
 
   #transition(live: LiveRun, state: RunState, patch: Partial<RunRecord>): void {
+    const previousState = live.record.state;
     live.record.state = state;
     if (patch.finalMessage !== undefined) live.record.finalMessage = patch.finalMessage;
     if (patch.error !== undefined) live.record.error = patch.error;
@@ -266,6 +269,15 @@ export class BridgeDaemon {
     this.#record(live, { atMs: Date.now(), method: "bridge/state", params: { state } });
     this.#save(live);
     this.#wake(live);
+    if (state !== previousState) this.#publishState(live.record);
+  }
+
+  #publishState(record: RunRecord): void {
+    if (this.#subscribers.size === 0) return;
+    const line = JSON.stringify({ notification: "run/stateChanged", record }) + "\n";
+    for (const socket of this.#subscribers) {
+      if (!socket.destroyed) socket.write(line);
+    }
   }
 
   #save(live: LiveRun): void {
@@ -343,6 +355,12 @@ export class BridgeDaemon {
       request = JSON.parse(line) as Record<string, unknown>;
     } catch {
       socket.write(JSON.stringify({ ok: false, error: "malformed control request" }) + "\n");
+      return;
+    }
+    if (request["op"] === "subscribe") {
+      this.#subscribers.add(socket);
+      socket.once("close", () => this.#subscribers.delete(socket));
+      socket.write(JSON.stringify({ ok: true, result: { subscribed: true } }) + "\n");
       return;
     }
     try {
@@ -630,6 +648,8 @@ export class BridgeDaemon {
    * whole process with it.
    */
   close(): void {
+    for (const subscriber of this.#subscribers) subscriber.destroy();
+    this.#subscribers.clear();
     this.#appServer?.close();
     this.#server.close();
     rmSync(this.#socketPath, { force: true });

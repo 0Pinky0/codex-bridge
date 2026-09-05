@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import type { BridgeClient } from "./client.js";
+import type { BridgeClient, RunStateNotification } from "./client.js";
 import { POLICY_KINDS, POLICY_MODES, type PolicyMode } from "./interaction.js";
 import { EXIT, exitCodeForRun, summarize } from "./outcome.js";
 import { needsHuman, type RunRecord } from "./run.js";
@@ -106,6 +106,7 @@ export function createMcpServer(options: McpServerOptions): McpServer {
   const server = new McpServer(
     { name: "codex-bridge", version: "0.1.0" },
     {
+      capabilities: { logging: {} },
       instructions:
         "Dispatch and supervise Codex App Server runs. A run can stop to ask a " +
         "question instead of finishing: whenever a result reports state " +
@@ -333,7 +334,27 @@ export function createMcpServer(options: McpServerOptions): McpServer {
   return server;
 }
 
+/**
+ * Forward daemon state events as standard MCP `notifications/message` events.
+ * Delivery is advisory and fire-and-forget: a closed MCP transport only drops
+ * the message, and never feeds back into daemon run progress.
+ */
+export async function subscribeMcpToRunStates(options: McpServerOptions, server: McpServer): Promise<() => void> {
+  await options.client.ensureDaemon(options.entrypoint);
+  return options.client.subscribe((notification: RunStateNotification) => {
+    void server.sendLoggingMessage({
+      level: "notice",
+      logger: "codex-bridge",
+      data: notification,
+    }).catch(() => {
+      // MCP notifications are best-effort. A dropped supervisor must not make
+      // the daemon or the run depend on its transport.
+    });
+  });
+}
+
 export async function serveMcpStdio(options: McpServerOptions): Promise<void> {
   const server = createMcpServer(options);
   await server.connect(new StdioServerTransport());
+  await subscribeMcpToRunStates(options, server);
 }

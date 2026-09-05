@@ -3,6 +3,11 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { defaultSocketPath } from "./daemon.js";
 
+export interface RunStateNotification {
+  type: "runStateChanged";
+  record: Record<string, unknown>;
+}
+
 /**
  * A control-request failure, tagged with whether the daemon could be reached.
  *
@@ -91,6 +96,73 @@ export class BridgeClient {
         // The daemon answered; it just said no. That is the caller's problem to
         // fix, not the transport's.
         else finish(new BridgeRequestError(String(response["error"] ?? "unknown daemon error"), false));
+      });
+    });
+  }
+
+  /**
+   * Keep a control connection open for daemon-originated run-state events.
+   *
+   * The returned function only closes this disposable client connection. The
+   * daemon never waits for a subscriber, and losing one cannot affect a run.
+   */
+  subscribe(onNotification: (notification: RunStateNotification) => void, timeoutMs = 3000): Promise<() => void> {
+    return new Promise((resolve, reject) => {
+      const socket = connect(this.#socketPath);
+      let buffer = "";
+      let subscribed = false;
+      let settled = false;
+
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        socket.destroy();
+        reject(new BridgeRequestError(`control subscription timed out after ${timeoutMs}ms`, true));
+      }, timeoutMs);
+
+      const failBeforeSubscribe = (message: string): void => {
+        if (settled || subscribed) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(new BridgeRequestError(message, true));
+      };
+
+      socket.setEncoding("utf8");
+      socket.on("error", (error) =>
+        failBeforeSubscribe(`cannot subscribe to codex-bridge daemon at ${this.#socketPath}: ${error.message}`),
+      );
+      socket.on("close", () => failBeforeSubscribe("daemon closed the subscription before acknowledging it"));
+      socket.on("connect", () => socket.write(JSON.stringify({ op: "subscribe" }) + "\n"));
+      socket.on("data", (chunk: string) => {
+        buffer += chunk;
+        for (;;) {
+          const index = buffer.indexOf("\n");
+          if (index < 0) break;
+          const line = buffer.slice(0, index);
+          buffer = buffer.slice(index + 1);
+          let message: Record<string, unknown>;
+          try {
+            message = JSON.parse(line) as Record<string, unknown>;
+          } catch {
+            failBeforeSubscribe("daemon returned malformed subscription JSON");
+            continue;
+          }
+          if (!subscribed) {
+            if (!message["ok"]) {
+              failBeforeSubscribe(String(message["error"] ?? "daemon refused the subscription"));
+              socket.destroy();
+              continue;
+            }
+            subscribed = true;
+            settled = true;
+            clearTimeout(timer);
+            resolve(() => socket.destroy());
+            continue;
+          }
+          if (message["notification"] === "run/stateChanged" && typeof message["record"] === "object") {
+            onNotification({ type: "runStateChanged", record: message["record"] as Record<string, unknown> });
+          }
+        }
       });
     });
   }
