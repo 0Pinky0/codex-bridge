@@ -79,6 +79,14 @@ test("the prose-question advisory catches the captured authority-boundary final 
   assert.equal(hasProseQuestionHint(fixture.finalMessage), true);
 });
 
+test("the prose-question advisory catches the captured first-paragraph Round-5 blocker", () => {
+  const fixture = JSON.parse(
+    readFileSync(new URL("./fixtures/prose-question-first-paragraph.json", import.meta.url), "utf8"),
+  );
+  assert.equal(fixture.sourceRunId, "run-mtogstp7-301qcb");
+  assert.equal(hasProseQuestionHint(fixture.finalMessage), true);
+});
+
 test("a prose-question hint stays completed, terminal, non-blocked, and exit 0", () => {
   const record = newRunRecord("run-advisory", "/tmp");
   record.state = "completed";
@@ -93,10 +101,19 @@ test("a prose-question hint stays completed, terminal, non-blocked, and exit 0",
   assert.match(summarize(record), /ADVISORY/);
 });
 
-test("the prose-question heuristic is limited to the final paragraph", () => {
-  assert.equal(hasProseQuestionHint("Did the tests pass?\n\nAll work is complete."), false);
+test("the prose-question fallback scans every paragraph but keeps no-question reports false", () => {
+  assert.equal(hasProseQuestionHint("Did the tests pass?\n\nAll work is complete."), true);
   assert.equal(hasProseQuestionHint("All work is complete."), false);
   assert.equal(hasProseQuestionHint("All work is complete. What next?"), true);
+});
+
+test("the prose-question fallback supports a full-width question mark", () => {
+  assert.equal(hasProseQuestionHint("需要我继续吗？\n\n当前工作已经完成。"), true);
+});
+
+test("the exact marker line is authoritative over prose fallback", () => {
+  assert.equal(hasProseQuestionHint("CODEX_BRIDGE_PROSE_QUESTION_HINT: true\n\nWork is complete."), true);
+  assert.equal(hasProseQuestionHint("CODEX_BRIDGE_PROSE_QUESTION_HINT: false\n\nDid the tests pass?"), false);
 });
 
 test("records round-trip through the store", () => {

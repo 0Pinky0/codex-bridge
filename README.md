@@ -75,6 +75,7 @@ codex-bridge resume <runId> --prompt '...' [--new-run] [--wait] [--timeout ms]
                             [--cwd d] [--model m] [--effort e] [--policy kind=mode]...
 codex-bridge status <runId>
 codex-bridge wait <runId> [--timeout ms]
+codex-bridge watch <runId> [--timeout ms]
 codex-bridge answer <runId> --request <id> --answer <value|json>
 codex-bridge interrupt <runId>
 codex-bridge list
@@ -165,13 +166,22 @@ structure reach the same conclusion.
 A completed run can also carry `proseQuestionHint: true`. This is an advisory,
 not a state: it never changes `completed`, `needsHuman`, terminality, or exit
 code 0, because prose has no parked `requestId` that `codex_answer` could
-answer. The explainable heuristic inspects only the final non-empty paragraph
-and flags either a literal `?` or an explicit `please authorize`, `please
-confirm`, `please choose`, `please decide`, `please provide`, `please clarify`,
-`please advise`, `please tell`, or `please select`. It can miss indirect asks,
-questions earlier in a long message, and other languages, and it can flag
-rhetorical or quoted questions. When present, the first-line summary also says
-that the final message may be asking for a response.
+answer. Packet authors can make the hint deterministic by putting exactly one
+of these machine-readable lines in the final message:
+
+```text
+CODEX_BRIDGE_PROSE_QUESTION_HINT: true
+CODEX_BRIDGE_PROSE_QUESTION_HINT: false
+```
+
+That exact, case-sensitive marker is authoritative. When it is absent, the
+fallback scans the whole message and flags `?`, the full-width `？`, or an
+explicit `please authorize`, `please confirm`, `please choose`, `please decide`,
+`please provide`, `please clarify`, `please advise`, `please tell`, or `please
+select`. It can miss indirect asks and languages that use neither question-mark
+form, and it can flag rhetorical or quoted questions anywhere in a completed
+report. When present, the first-line summary also says that the final message
+may be asking for a response.
 
 `codex_wait` is **bounded** — 60s by default, 240s maximum. When the window
 elapses before the run settles, the result says the run has *not* finished, sets
@@ -179,6 +189,15 @@ elapses before the run settles, the result says the run has *not* finished, sets
 that ran until the MCP client's own timeout would surface as a transport error
 instead of a run state, losing exactly the information the tool exists to
 report.
+
+MCP logging notifications cannot wake an idle supervising model: the bridge can
+deliver `notifications/message` to the host, but the host may not schedule the
+model to read it. For a reliable process-level wake-up, launch
+`codex-bridge watch <runId>` in the background. `watch` repeatedly crosses the
+daemon's bounded wait windows until the run is completed, blocked, failed, or
+interrupted, then its process exits with the semantic code below. `--timeout`
+sets each bounded window; it is not an overall deadline. An already-settled run
+returns promptly. The existing `wait` and `codex_wait` commands remain bounded.
 
 ### Exit codes are the contract
 
@@ -276,6 +295,13 @@ Unix domain socket paths are capped at 108 bytes, and the failure is a bare
 control socket therefore lives at `$XDG_RUNTIME_DIR/codex-bridge-<uid>/control.sock`
 — falling back to `/tmp` when the runtime dir is itself long — and never under
 the (long) bridge home. Override with `CODEX_BRIDGE_SOCKET`.
+
+A daemon on a custom socket is intentionally not auto-stopped when idle: it may
+own a blocked run indefinitely. Stop it explicitly with `codex-bridge daemon
+stop --socket /path/to/control.sock` (or with the same `CODEX_BRIDGE_SOCKET`
+environment value used to start it). The daemon also records its socket path in
+`$CODEX_BRIDGE_HOME/daemon.json`; there is no safe global scan that can discover
+an arbitrary socket and home pair.
 
 ### Explicit everything
 

@@ -86,6 +86,18 @@ async function main(): Promise<void> {
     process.exit(exitCodeForRun(record));
   };
 
+  /** Keep crossing bounded daemon wait windows until the run actually settles. */
+  const watchAndExit = async (runId: string): Promise<never> => {
+    const timeoutMs = Number(flags["timeout"] ?? 240000);
+    for (;;) {
+      const record = (await client.send({ op: "wait", runId, timeoutMs }, timeoutMs + 30000)) as RunRecord;
+      if (exitCodeForRun(record) === EXIT.STILL_RUNNING) continue;
+      print(record);
+      process.stderr.write(summarize(record) + "\n");
+      process.exit(exitCodeForRun(record));
+    }
+  };
+
   switch (command) {
     case "daemon": {
       const sub = positional[0] ?? (flags["foreground"] ? "--foreground" : "status");
@@ -192,6 +204,13 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "watch": {
+      const runId = positional[0];
+      if (!runId) fail("watch requires a run id");
+      await watchAndExit(runId);
+      return;
+    }
+
     case "answer": {
       const runId = positional[0];
       const requestId = flags["request"];
@@ -245,7 +264,7 @@ async function main(): Promise<void> {
         [
           "codex-bridge -- bidirectional bridge to the Codex App Server",
           "",
-          "  daemon [start|stop|status|--foreground]",
+          "  daemon [start|stop|status|--foreground] [--socket path]",
           "  dispatch --cwd <dir> --prompt <text> [--wait] [--timeout ms]",
           "           [--model m] [--effort e] [--sandbox s] [--approval p]",
           "           [--policy kind=mode]... [--auto-approve | --auto-deny]",
@@ -253,6 +272,7 @@ async function main(): Promise<void> {
           "                 [--cwd d] [--model m] [--effort e] [--policy kind=mode]...",
           "  status <runId>",
           "  wait <runId> [--timeout ms]",
+          "  watch <runId> [--timeout ms]   wait across windows until settled",
           "  answer <runId> --request <id> --answer <value|json>",
           "  interrupt <runId>",
           "  list",

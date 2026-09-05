@@ -40,18 +40,19 @@ export function needsHuman(state: RunState): boolean {
 }
 
 /**
- * Modest natural-language heuristic for completed messages that may be asking
- * the supervisor to respond. Only the final non-empty paragraph is inspected.
- * It detects a literal `?` or a short list of explicit "please <verb>" requests.
- * It intentionally does not claim to understand indirect requests, other
- * languages, or questions earlier in a long final message.
+ * Detect whether a completed message may be asking the supervisor to respond.
+ * An exact marker line is authoritative; without one, the whole message is
+ * scanned for ASCII/full-width question marks and explicit "please <verb>"
+ * requests. This remains advisory because no server request is parked.
  */
 export function hasProseQuestionHint(message: string | null): boolean {
   if (!message?.trim()) return false;
-  const paragraphs = message.trim().split(/\n\s*\n/);
-  const finalParagraph = paragraphs.at(-1) ?? "";
-  if (finalParagraph.includes("?")) return true;
-  return /\bplease\s+(?:authorize|confirm|choose|decide|provide|clarify|advise|tell|select)\b/i.test(finalParagraph);
+  const marker = message
+    .split(/\r?\n/)
+    .find((line) => line === "CODEX_BRIDGE_PROSE_QUESTION_HINT: true" || line === "CODEX_BRIDGE_PROSE_QUESTION_HINT: false");
+  if (marker) return marker.endsWith("true");
+  if (/[?？]/.test(message)) return true;
+  return /\bplease\s+(?:authorize|confirm|choose|decide|provide|clarify|advise|tell|select)\b/i.test(message);
 }
 
 export interface RunEvent {
