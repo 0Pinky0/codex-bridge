@@ -9,6 +9,12 @@ finished"**. Both are recorded as `status=completed`, so a run that paused for
 authorization can sit unnoticed for hours. Everything here is organized around
 removing that ambiguity.
 
+The mirror-image failure is also explicit: a nominally running turn that emits
+no events for 15 minutes becomes `stalled`. The default deliberately exceeds a
+known legitimate nine-minute silent `pytest` command while still detecting a
+dead turn far sooner than an hour-long watch. Set
+`CODEX_BRIDGE_STALL_TIMEOUT_MS` before starting the daemon to tune the window.
+
 ```
 $ codex-bridge dispatch --cwd /repo --prompt 'refactor the parser' --wait
 ...
@@ -134,9 +140,14 @@ continuation gets a fresh runId carrying a `bridge/resumedFrom` event, and the
 original record — which holds the evidence of *why* a resume was needed — is
 left untouched.
 
-A run that is still `blocked` or `running` is refused rather than resumed. A
+A run that is still `blocked`, `running`, or `stalled` is refused rather than resumed. A
 second turn on a live thread would orphan the parked approval that made the run
-interesting in the first place; answer it or interrupt it first.
+interesting in the first place; answer it or interrupt it first. After the App
+Server accepts `turn/start`, `resume` also waits up to 10 seconds for real turn
+activity (`turn/started`, an item event, a server request, or completion). If
+none arrives, the run is marked `failed` and the resume call returns the precise
+failure instead of a run id that only appears to be progressing. The bounded
+window is configurable with `CODEX_BRIDGE_RESUME_START_TIMEOUT_MS`.
 
 ### MCP server
 
@@ -146,8 +157,8 @@ interesting in the first place; answer it or interrupt it first.
 
 The MCP server also subscribes to the daemon's control socket and emits a
 standard `notifications/message` logging notification whenever a run changes
-state, including when it becomes `blocked` or reaches `completed`, `failed`, or
-`interrupted`. The notification data contains `{ type: "runStateChanged",
+state, including when it becomes `blocked` or `stalled`, or reaches `completed`,
+`failed`, or `interrupted`. The notification data contains `{ type: "runStateChanged",
 record }`. Delivery is best-effort: disconnected clients miss events, and the
 daemon neither buffers them nor waits for delivery, so a dropped MCP client can
 never delay or damage a run.
@@ -156,12 +167,12 @@ never delay or damage a run.
 { "command": "node", "args": ["/path/to/codex-bridge/dist/cli.js", "mcp"] }
 ```
 
-A model has no exit code to read, so the blocked/completed distinction is
-carried twice on every run-shaped result: the first line of text is the same
-summary the CLI prints (which never describes a blocked run in words that read
-as success), and `structuredContent.needsHuman` is a boolean to branch on. Both
-are always present, so a caller reading only the prose and one reading only the
-structure reach the same conclusion.
+A model has no exit code to read, so unhealthy states are carried twice on
+every run-shaped result: the first line is the same unmistakable summary the
+CLI prints, while `structuredContent.needsHuman` and
+`structuredContent.stalled` are booleans to branch on. These fields are always
+present, so callers reading only prose or only structure reach the same
+conclusion.
 
 A completed run can also carry `proseQuestionHint: true`. This is an advisory,
 not a state: it never changes `completed`, `needsHuman`, terminality, or exit
@@ -194,8 +205,10 @@ MCP logging notifications cannot wake an idle supervising model: the bridge can
 deliver `notifications/message` to the host, but the host may not schedule the
 model to read it. For a reliable process-level wake-up, launch
 `codex-bridge watch <runId>` in the background. `watch` repeatedly crosses the
-daemon's bounded wait windows until the run is completed, blocked, failed, or
-interrupted, then its process exits with the semantic code below. `--timeout`
+daemon's bounded wait windows until the run is completed, blocked, stalled,
+failed, or interrupted, then its process exits with the semantic code below. A
+stall timer wakes an outstanding wait immediately; `watch` does not have to
+finish its current window first. `--timeout`
 sets the size of each bounded daemon wait window; it is not an overall deadline.
 If the daemon becomes unreachable, `watch` alone retries the connection with
 backoff for up to `--retry-unreachable` milliseconds (300000ms by default).
@@ -217,10 +230,11 @@ returns promptly because a daemon response is never retried. The existing
 | 12 | failed |
 | 13 | interrupted |
 | 14 | daemon unreachable |
+| **15** | **STALLED — no event activity beyond the configured threshold** |
 
-A caller that only checks for exit 0 still will not mistake a blocked run for a
-finished one. A caller that reads the code learns exactly what happened without
-parsing prose.
+A caller that only checks for exit 0 still will not mistake a blocked or stalled
+run for a finished one. A caller that reads the code learns exactly what
+happened without parsing prose. Existing codes retain their prior meanings.
 
 The prose-question advisory deliberately has no new exit code. It is uncertain
 and unanswerable through `codex_answer`; changing a completed run's exit status
@@ -259,6 +273,13 @@ There is no self-maintained PID file that callers are asked to trust: a stale
 `running` record pointing at a dead PID is exactly the bookkeeping that blocks a
 resume and has to be hand-repaired.
 
+While the daemon is alive, each run records `lastEventAtMs`,
+`stallThresholdMs`, and the explicit `stalled` boolean. App Server activity
+resets the inactivity timer; status reads and derived bridge diagnostics do
+not. Crossing the threshold appends `bridge/stalled` without rewriting prior
+events, sets state `stalled`, persists the snapshot, publishes the transition,
+and wakes waiters. Later real activity can return the live run to `running`.
+
 Each run is persisted under `$CODEX_BRIDGE_HOME` (default `~/.codex-bridge`):
 
 ```
@@ -271,7 +292,8 @@ ahead of the snapshot rather than the reverse. A snapshot must never claim more
 progress than the log can substantiate.
 
 On startup the daemon reconciles runs that a previous daemon left non-terminal.
-A `running` record with no process behind it is a lie, so it is marked `failed`
+A `running`, `blocked`, or `stalled` record with no process behind it is a lie,
+so it is marked `failed`
 with a `bridge/orphaned` event and an error that names the state it died in and
 the exact `codex-bridge resume` command that picks the work back up — the
 resume-blocking bookkeeping is repaired rather than described.
@@ -334,6 +356,10 @@ create user namespaces.
   `failed` (exit 12). The protocol has a first-class `interrupted` turn status;
   reporting it as a failure would send a caller hunting for an error that does
   not exist.
+- An `item/started` event for a collaboration `wait` whose
+  `receiverThreadIds` is empty adds a non-fatal `empty_wait_receivers` warning
+  to the record and a `bridge/warning` event. It remains diagnostic: the bridge
+  neither answers nor fails the turn on its own.
 
 ## Environment
 
@@ -342,6 +368,8 @@ create user namespaces.
 | `CODEX_BRIDGE_HOME` | run store root (default `~/.codex-bridge`) |
 | `CODEX_BRIDGE_SOCKET` | control socket path |
 | `CODEX_BIN` | `codex` executable (default: `codex` on `PATH`) |
+| `CODEX_BRIDGE_STALL_TIMEOUT_MS` | event inactivity threshold (default `900000`, 15 minutes) |
+| `CODEX_BRIDGE_RESUME_START_TIMEOUT_MS` | resumed-turn activity deadline (default `10000`, 10 seconds) |
 
 ## Protocol bindings
 
@@ -371,7 +399,7 @@ Verified end to end against `codex` 0.152.0 on Linux:
   a full `daemon stop` produced a fresh runId on the same thread and left the
   original record intact; `resume` on a blocked run was refused
 
-`npm run ci` is green (75 tests). Beyond the unit tests, `test/bridge.test.js`
+`npm run ci` is green. Beyond the unit tests, `test/bridge.test.js`
 drives the real control socket against a scripted App Server stand-in
 (`test/fixtures/fake-app-server.mjs`), because the behaviours that matter here —
 a parked request, a resume across a daemon restart, a run orphaned by a dead

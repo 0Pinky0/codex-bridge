@@ -45,6 +45,10 @@ function record(overrides = {}) {
     error: null,
     pending: [],
     eventCount: 3,
+    lastEventAtMs: 2,
+    stallThresholdMs: 900_000,
+    stalled: false,
+    warnings: [],
     ...overrides,
   };
 }
@@ -135,6 +139,17 @@ test("a completed run reports needsHuman false and carries the final message", a
   await client.close();
 });
 
+test("a stalled run is unmistakable in both text and structured content", async () => {
+  const client = await connect(() => record({ state: "stalled", stalled: true }));
+  const result = await client.callTool({ name: "codex_status", arguments: { runId: "run-test" } });
+  assert.match(result.content[0].text, /STALLED/);
+  assert.equal(result.structuredContent.state, "stalled");
+  assert.equal(result.structuredContent.stalled, true);
+  assert.equal(result.structuredContent.needsHuman, false);
+  assert.equal(result.structuredContent.exitCode, 15);
+  await client.close();
+});
+
 test("a prose-question advisory is structured and textual without fabricating blocked", async () => {
   const client = await connect(() =>
     record({ finalMessage: "Please confirm the next step.", proseQuestionHint: true }),
@@ -163,7 +178,7 @@ test("a wait that times out is reported as unfinished, never as a completion", a
 });
 
 test("a wait that settles is not marked as timed out", async () => {
-  for (const state of ["completed", "failed", "interrupted", "blocked"]) {
+  for (const state of ["completed", "failed", "interrupted", "blocked", "stalled"]) {
     const client = await connect(() => record({ state, error: "boom" }));
     const result = await client.callTool({ name: "codex_wait", arguments: { runId: "run-test" } });
     assert.equal(result.structuredContent.timedOut, false, state);

@@ -12,8 +12,9 @@ import type { InteractionPolicy, PendingInteraction } from "./interaction.js";
 /**
  * Run state model and durable event log.
  *
- * The single most important design rule lives here: `blocked` is a distinct
- * terminal-looking state that is NOT `completed`. A supervising process that
+ * The single most important design rule lives here: `blocked` and `stalled`
+ * are distinct terminal-looking states that are NOT `completed`. A supervising
+ * process that
  * cannot tell "the agent stopped to ask you something" from "the agent
  * finished" will sit on a finished-looking run for hours. Any code that maps
  * these two states together is a bug, and `isTerminal()` deliberately excludes
@@ -26,6 +27,7 @@ export type RunState =
   | "starting"
   | "running"
   | "blocked"
+  | "stalled"
   | "completed"
   | "failed"
   | "interrupted";
@@ -62,6 +64,13 @@ export interface RunEvent {
   params?: unknown;
 }
 
+export interface RunWarning {
+  code: string;
+  message: string;
+  atMs: number;
+  itemId?: string;
+}
+
 export interface RunRecord {
   runId: string;
   threadId: string | null;
@@ -80,6 +89,12 @@ export interface RunRecord {
   policy: InteractionPolicy;
   createdAtMs: number;
   updatedAtMs: number;
+  /** Timestamp of the last event observed for this run, not the last status read. */
+  lastEventAtMs: number;
+  /** Inactivity window applied by the daemon that owns this run. */
+  stallThresholdMs: number;
+  /** Explicit mirror of `state === "stalled"` for structured consumers. */
+  stalled: boolean;
   /** Final assistant message, populated on completion. */
   finalMessage: string | null;
   /** Heuristic advisory only; unlike `blocked`, there is no parked request. */
@@ -94,6 +109,8 @@ export interface RunRecord {
    * short log as a complete one.
    */
   storeError: string | null;
+  /** Non-fatal diagnostics discovered while observing the turn. */
+  warnings: RunWarning[];
   /** Outstanding server requests awaiting a human answer. */
   pending: PendingInteraction[];
   /** Monotonic count of events appended, so clients can poll incrementally. */
@@ -114,10 +131,14 @@ export function newRunRecord(runId: string, cwd: string): RunRecord {
     policy: {},
     createdAtMs: now,
     updatedAtMs: now,
+    lastEventAtMs: now,
+    stallThresholdMs: 900_000,
+    stalled: false,
     finalMessage: null,
     proseQuestionHint: false,
     error: null,
     storeError: null,
+    warnings: [],
     pending: [],
     eventCount: 0,
   };
@@ -166,6 +187,10 @@ export class RunStore {
       // it would read as "no policy set" only by accident.
       record.policy ??= {};
       record.storeError ??= null;
+      record.lastEventAtMs ??= this.#lastEventAtMs(record.runId) ?? record.createdAtMs;
+      record.stallThresholdMs ??= 900_000;
+      record.stalled ??= record.state === "stalled";
+      record.warnings ??= [];
       record.proseQuestionHint ??=
         record.state === "completed" && hasProseQuestionHint(record.finalMessage);
       return record;
@@ -174,9 +199,10 @@ export class RunStore {
     }
   }
 
-  appendEvent(record: RunRecord, event: RunEvent): void {
+  appendEvent(record: RunRecord, event: RunEvent, observedActivity = true): void {
     appendFileSync(join(this.runDir(record.runId), "events.jsonl"), JSON.stringify(event) + "\n", "utf8");
     record.eventCount += 1;
+    if (observedActivity) record.lastEventAtMs = event.atMs;
   }
 
   readEvents(runId: string, since = 0, limit = 500): RunEvent[] {
@@ -192,6 +218,23 @@ export class RunStore {
       }
     }
     return out;
+  }
+
+  #lastEventAtMs(runId: string): number | null {
+    const path = join(this.runDir(runId), "events.jsonl");
+    if (!existsSync(path)) return null;
+    const lines = readFileSync(path, "utf8").split("\n");
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      const line = lines[index];
+      if (!line?.trim()) continue;
+      try {
+        const event = JSON.parse(line) as Partial<RunEvent>;
+        if (typeof event.atMs === "number") return event.atMs;
+      } catch {
+        // Keep looking: a corrupt tail is already exposed by `readEvents`.
+      }
+    }
+    return null;
   }
 
   list(): RunRecord[] {

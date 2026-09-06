@@ -13,6 +13,9 @@
  *   approve:<cmd> send an exec approval request, then complete or fail on it
  *   hang          start the turn and never finish it
  *   crash         exit the process mid-turn
+ *   slow-alive    emit activity while a deliberately slow turn runs
+ *   no-start      accept turn/start without emitting turn activity
+ *   empty-wait    emit a collab wait that has no receivers
  */
 
 let buffer = "";
@@ -128,6 +131,7 @@ function handle(message) {
       threads.set(threadId, { ...(threads.get(threadId) ?? {}), turnId, done: false });
       persistThreads();
       reply(id, { turnId });
+      if (String(params.input?.[0]?.text ?? "") === "no-start") return;
       notify("turn/started", { threadId, turn: { id: turnId } });
       void runTurn(threadId, String(params.input?.[0]?.text ?? ""));
       return;
@@ -148,6 +152,32 @@ async function runTurn(threadId, prompt) {
     return;
   }
   if (prompt === "hang") return;
+  if (prompt === "slow-alive") {
+    let sequence = 0;
+    const timer = setInterval(() => {
+      notify("item/agentMessage/delta", { threadId, turnId: threads.get(threadId)?.turnId, delta: String(sequence++) });
+    }, 40);
+    setTimeout(() => {
+      clearInterval(timer);
+      completeTurn(threadId, "completed", "slow but alive");
+    }, 260);
+    return;
+  }
+  if (prompt === "empty-wait") {
+    notify("item/started", {
+      threadId,
+      turnId: threads.get(threadId)?.turnId,
+      item: {
+        id: "wait-on-nobody",
+        type: "collabAgentToolCall",
+        tool: "wait",
+        receiverThreadIds: [],
+        status: "inProgress",
+      },
+    });
+    completeTurn(threadId, "completed", "warning emitted");
+    return;
+  }
   if (prompt === "crash") {
     process.exit(3);
   }

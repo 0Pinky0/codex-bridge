@@ -15,15 +15,16 @@ function withStore(fn) {
   }
 }
 
-test("blocked is not terminal, so a waiter never treats it as finished", () => {
+test("blocked and stalled are not terminal, so neither is mistaken for finished", () => {
   assert.equal(isTerminal("blocked"), false);
   assert.equal(needsHuman("blocked"), true);
   for (const state of ["completed", "failed", "interrupted"]) {
     assert.equal(isTerminal(state), true, state);
     assert.equal(needsHuman(state), false, state);
   }
-  for (const state of ["starting", "running"]) {
+  for (const state of ["starting", "running", "stalled"]) {
     assert.equal(isTerminal(state), false, state);
+    assert.equal(needsHuman(state), false, state);
   }
 });
 
@@ -35,10 +36,10 @@ test("a blocked run does not exit 0", () => {
   assert.notEqual(exitCodeForRun(record), EXIT.OK);
 });
 
-test("every state maps to a distinct, non-success exit code except completed", () => {
+test("every state maps to its documented exit code without changing existing meanings", () => {
   const record = newRunRecord("run-1", "/tmp");
   const codes = {};
-  for (const state of ["completed", "blocked", "failed", "interrupted", "running", "starting"]) {
+  for (const state of ["completed", "blocked", "failed", "interrupted", "running", "starting", "stalled"]) {
     record.state = state;
     codes[state] = exitCodeForRun(record);
   }
@@ -48,8 +49,22 @@ test("every state maps to a distinct, non-success exit code except completed", (
   assert.equal(codes.starting, 11);
   assert.equal(codes.failed, 12);
   assert.equal(codes.interrupted, 13);
+  assert.equal(codes.stalled, 15);
+  assert.equal(EXIT.USAGE, 2);
+  assert.equal(EXIT.UNREACHABLE, 14);
   const nonSuccess = Object.entries(codes).filter(([state]) => state !== "completed");
   for (const [state, code] of nonSuccess) assert.notEqual(code, 0, `${state} must not look like success`);
+});
+
+test("a stalled summary is unmistakably unhealthy", () => {
+  const record = newRunRecord("run-stalled", "/tmp");
+  record.state = "stalled";
+  record.stalled = true;
+  record.lastEventAtMs = 1_000;
+  record.stallThresholdMs = 900_000;
+  const text = summarize(record);
+  assert.match(text, /STALLED/);
+  assert.doesNotMatch(text, /success|completed/i);
 });
 
 test("the summary of a blocked run says BLOCKED and lists the questions", () => {

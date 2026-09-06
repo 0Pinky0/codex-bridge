@@ -24,6 +24,7 @@ export const EXIT = {
   FAILED: 12,
   INTERRUPTED: 13,
   UNREACHABLE: 14,
+  STALLED: 15,
 } as const;
 
 export function exitCodeForRun(record: RunRecord): number {
@@ -36,6 +37,8 @@ export function exitCodeForRun(record: RunRecord): number {
       return EXIT.FAILED;
     case "interrupted":
       return EXIT.INTERRUPTED;
+    case "stalled":
+      return EXIT.STALLED;
     default:
       return EXIT.STILL_RUNNING;
   }
@@ -55,6 +58,10 @@ export function summarize(record: RunRecord): string {
     return record.proseQuestionHint
       ? `run ${record.runId} completed (ADVISORY: final message may be asking for a response)`
       : `run ${record.runId} completed`;
+  }
+  if (record.state === "stalled") {
+    const quietMs = Math.max(0, Date.now() - record.lastEventAtMs);
+    return `run ${record.runId} is STALLED: no events for ${quietMs}ms (threshold: ${record.stallThresholdMs}ms)`;
   }
   if (record.state === "failed") return `run ${record.runId} failed: ${record.error ?? "unknown error"}`;
   if (record.state === "interrupted") return `run ${record.runId} was interrupted`;

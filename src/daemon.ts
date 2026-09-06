@@ -41,7 +41,12 @@ export interface DaemonOptions {
   socketPath?: string;
   codexPath?: string;
   defaultPolicy?: InteractionPolicy;
+  stallTimeoutMs?: number;
+  resumeStartTimeoutMs?: number;
 }
+
+export const DEFAULT_STALL_TIMEOUT_MS = 15 * 60_000;
+export const DEFAULT_RESUME_START_TIMEOUT_MS = 10_000;
 
 export function defaultHome(): string {
   return process.env["CODEX_BRIDGE_HOME"] ?? join(homedir(), ".codex-bridge");
@@ -67,6 +72,10 @@ interface LiveRun {
   /** Resolvers for parked server requests, keyed by JSON-RPC request id. */
   parked: Map<string, { pending: PendingInteraction; resolve: (value: unknown) => void; reject: (error: Error) => void }>;
   waiters: Array<() => void>;
+  stallTimer: NodeJS.Timeout | null;
+  turnActivityIds: Set<string>;
+  unscopedTurnActivityVersion: number;
+  turnActivityWaiters: Array<() => void>;
 }
 
 export class BridgeDaemon {
@@ -74,6 +83,8 @@ export class BridgeDaemon {
   #socketPath: string;
   #codexPath: string;
   #policy: InteractionPolicy;
+  #stallTimeoutMs: number;
+  #resumeStartTimeoutMs: number;
   #appServer: AppServer | null = null;
   #runs = new Map<string, LiveRun>();
   #byThread = new Map<string, string>();
@@ -87,6 +98,16 @@ export class BridgeDaemon {
     this.#socketPath = options.socketPath ?? defaultSocketPath();
     this.#codexPath = options.codexPath ?? process.env["CODEX_BIN"] ?? "codex";
     this.#policy = options.defaultPolicy ?? {};
+    this.#stallTimeoutMs = positiveDuration(
+      options.stallTimeoutMs ?? process.env["CODEX_BRIDGE_STALL_TIMEOUT_MS"] ?? DEFAULT_STALL_TIMEOUT_MS,
+      "stall timeout",
+    );
+    this.#resumeStartTimeoutMs = positiveDuration(
+      options.resumeStartTimeoutMs ??
+        process.env["CODEX_BRIDGE_RESUME_START_TIMEOUT_MS"] ??
+        DEFAULT_RESUME_START_TIMEOUT_MS,
+      "resume start timeout",
+    );
   }
 
   get socketPath(): string {
@@ -137,6 +158,7 @@ export class BridgeDaemon {
       if (isTerminal(record.state)) continue;
       const previousState = record.state;
       record.state = "failed";
+      record.stalled = false;
       record.pending = [];
       record.error =
         `orphaned: the daemon that owned this run exited while it was '${previousState}'` +
@@ -182,7 +204,16 @@ export class BridgeDaemon {
     const live = threadId ? this.#liveByThread(threadId) : null;
     if (!live) return;
 
+    const wasStalled = live.record.state === "stalled";
     this.#record(live, { atMs: Date.now(), method, params });
+    if (method === "turn/started" || method === "turn/completed" || method.startsWith("item/")) {
+      this.#markTurnActivity(live, record);
+    }
+    if (method === "item/started") this.#warnOnEmptyWait(live, record);
+    if (isTerminal(live.record.state)) {
+      this.#save(live);
+      return;
+    }
 
     switch (method) {
       case "turn/started": {
@@ -215,7 +246,8 @@ export class BridgeDaemon {
         break;
       }
       default:
-        this.#save(live);
+        if (wasStalled) this.#transition(live, "running", {});
+        else this.#save(live);
         break;
     }
   }
@@ -238,6 +270,11 @@ export class BridgeDaemon {
     }
 
     this.#record(live, { atMs: Date.now(), method: `serverRequest/${method}`, params });
+    this.#markTurnActivity(live, record);
+    if (isTerminal(live.record.state)) {
+      throw new Error(`codex-bridge received '${method}' after run '${live.record.runId}' was ${live.record.state}`);
+    }
+    if (live.record.state === "stalled") this.#transition(live, "running", {});
 
     if (disposition.type === "unsupported") {
       this.#record(live, {
@@ -271,13 +308,16 @@ export class BridgeDaemon {
   #transition(live: LiveRun, state: RunState, patch: Partial<RunRecord>): void {
     const previousState = live.record.state;
     live.record.state = state;
+    live.record.stalled = state === "stalled";
     if (patch.finalMessage !== undefined) live.record.finalMessage = patch.finalMessage;
     live.record.proseQuestionHint = state === "completed" && hasProseQuestionHint(live.record.finalMessage);
     if (patch.error !== undefined) live.record.error = patch.error;
     if (state !== "blocked") live.record.pending = [...live.parked.values()].map((e) => e.pending);
-    this.#record(live, { atMs: Date.now(), method: "bridge/state", params: { state } });
+    this.#record(live, { atMs: Date.now(), method: "bridge/state", params: { state } }, false);
     this.#save(live);
+    this.#scheduleStallCheck(live);
     this.#wake(live);
+    if (isTerminal(state)) this.#wakeTurnActivity(live);
     if (state !== previousState) this.#publishState(live.record);
   }
 
@@ -303,8 +343,92 @@ export class BridgeDaemon {
    * the run and reported on stderr rather than swallowed, because a silently
    * short transcript is one that reads as complete.
    */
-  #record(live: LiveRun, event: RunEvent): void {
-    this.#guardStore(live, `event ${event.method}`, () => this.#store.appendEvent(live.record, event));
+  #record(live: LiveRun, event: RunEvent, observedActivity = true): void {
+    this.#guardStore(live, `event ${event.method}`, () =>
+      this.#store.appendEvent(live.record, event, observedActivity));
+    if (observedActivity) this.#scheduleStallCheck(live);
+  }
+
+  #scheduleStallCheck(live: LiveRun): void {
+    if (live.stallTimer) clearTimeout(live.stallTimer);
+    live.stallTimer = null;
+    if (live.record.state !== "running") return;
+    const remaining = Math.max(1, this.#stallTimeoutMs - (Date.now() - live.record.lastEventAtMs));
+    live.stallTimer = setTimeout(() => this.#refreshStall(live), remaining);
+  }
+
+  #refreshStall(live: LiveRun): void {
+    if (live.record.state !== "running") return;
+    const quietMs = Date.now() - live.record.lastEventAtMs;
+    if (quietMs < this.#stallTimeoutMs) {
+      this.#scheduleStallCheck(live);
+      return;
+    }
+    live.record.state = "stalled";
+    live.record.stalled = true;
+    this.#record(live, {
+      atMs: Date.now(),
+      method: "bridge/stalled",
+      params: { lastEventAtMs: live.record.lastEventAtMs, quietMs, thresholdMs: this.#stallTimeoutMs },
+    }, false);
+    this.#save(live);
+    this.#wake(live);
+    this.#publishState(live.record);
+  }
+
+  #markTurnActivity(live: LiveRun, notification: Record<string, unknown> | null): void {
+    const turn = notification?.["turn"] as Record<string, unknown> | undefined;
+    const turnId = typeof notification?.["turnId"] === "string"
+      ? notification["turnId"]
+      : typeof turn?.["id"] === "string"
+        ? turn["id"]
+        : null;
+    if (turnId) live.turnActivityIds.add(turnId);
+    else live.unscopedTurnActivityVersion += 1;
+    this.#wakeTurnActivity(live);
+  }
+
+  #wakeTurnActivity(live: LiveRun): void {
+    const waiters = live.turnActivityWaiters.splice(0);
+    for (const waiter of waiters) waiter();
+  }
+
+  async #waitForTurnActivity(live: LiveRun, turnId: string | null, unscopedBaseline: number): Promise<boolean> {
+    const hasActivity = (): boolean =>
+      (turnId !== null && live.turnActivityIds.has(turnId)) ||
+      live.unscopedTurnActivityVersion > unscopedBaseline;
+    if (hasActivity()) return true;
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        const index = live.turnActivityWaiters.indexOf(onActivity);
+        if (index >= 0) live.turnActivityWaiters.splice(index, 1);
+        resolve();
+      }, this.#resumeStartTimeoutMs);
+      function onActivity(): void {
+        clearTimeout(timer);
+        resolve();
+      }
+      live.turnActivityWaiters.push(onActivity);
+    });
+    return hasActivity();
+  }
+
+  #warnOnEmptyWait(live: LiveRun, notification: Record<string, unknown> | null): void {
+    const item = notification?.["item"] as Record<string, unknown> | undefined;
+    if (
+      item?.["type"] !== "collabAgentToolCall" ||
+      item["tool"] !== "wait" ||
+      !Array.isArray(item["receiverThreadIds"]) ||
+      item["receiverThreadIds"].length !== 0
+    ) return;
+    const warning = {
+      code: "empty_wait_receivers",
+      message: "collaboration wait has an empty receiver list and is waiting on nobody",
+      atMs: Date.now(),
+      ...(typeof item["id"] === "string" ? { itemId: item["id"] } : {}),
+    };
+    live.record.warnings.push(warning);
+    this.#record(live, { atMs: warning.atMs, method: "bridge/warning", params: warning }, false);
   }
 
   #guardStore(live: LiveRun | null, label: string, write: () => void): void {
@@ -323,7 +447,7 @@ export class BridgeDaemon {
    * until a human acts.
    */
   #wake(live: LiveRun): void {
-    if (!isTerminal(live.record.state) && live.record.state !== "blocked") return;
+    if (!isTerminal(live.record.state) && live.record.state !== "blocked" && live.record.state !== "stalled") return;
     const waiters = live.waiters.splice(0);
     for (const waiter of waiters) waiter();
   }
@@ -335,7 +459,7 @@ export class BridgeDaemon {
 
   #broadcastBridgeEvent(method: string, params: unknown): void {
     for (const live of this.#runs.values()) {
-      this.#record(live, { atMs: Date.now(), method, params });
+      this.#record(live, { atMs: Date.now(), method, params }, false);
     }
   }
 
@@ -399,9 +523,11 @@ export class BridgeDaemon {
       case "resume":
         return this.#opResume(request);
       case "status":
-        return this.#requireRecord(String(request["runId"] ?? ""));
-      case "list":
+        return this.#status(String(request["runId"] ?? ""));
+      case "list": {
+        for (const live of this.#runs.values()) this.#refreshStall(live);
         return this.#store.list();
+      }
       case "events":
         return this.#store.readEvents(
           String(request["runId"] ?? ""),
@@ -437,13 +563,14 @@ export class BridgeDaemon {
 
     const runId = `run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     const record = newRunRecord(runId, cwd);
+    record.stallThresholdMs = this.#stallTimeoutMs;
     record.model = (request["model"] as string) ?? null;
     record.sandbox = (request["sandbox"] as string) ?? null;
     record.approvalPolicy = (request["approvalPolicy"] as string) ?? null;
     record.policy = policy;
     this.#store.create(record);
 
-    const live: LiveRun = { record, parked: new Map(), waiters: [] };
+    const live = this.#newLive(record);
     this.#runs.set(runId, live);
 
     const { threadId } = await appServer.startThread({
@@ -467,6 +594,7 @@ export class BridgeDaemon {
     record.turnId = turnId;
     if (record.state === "starting") record.state = "running";
     this.#save(live);
+    this.#scheduleStallCheck(live);
 
     return { runId, threadId, turnId };
   }
@@ -518,6 +646,7 @@ export class BridgeDaemon {
       // holds a failure or an unanswered question destroys the evidence of why
       // a resume was needed in the first place.
       record = newRunRecord(`run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`, cwd);
+      record.stallThresholdMs = this.#stallTimeoutMs;
       record.threadId = threadId;
       record.model = (request["model"] as string) ?? source.model;
       record.sandbox = source.sandbox;
@@ -529,7 +658,7 @@ export class BridgeDaemon {
         method: "bridge/resumedFrom",
         params: { runId: source.runId, threadId },
       });
-      live = { record, parked: new Map(), waiters: [] };
+      live = this.#newLive(record);
     } else {
       record = source;
       record.cwd = cwd;
@@ -541,8 +670,10 @@ export class BridgeDaemon {
       record.turnId = null;
       if (request["model"] !== undefined && request["model"] !== null) record.model = request["model"] as string;
       if (Object.keys(policy).length > 0) record.policy = policy;
-      live = existing ?? { record, parked: new Map(), waiters: [] };
+      live = existing ?? this.#newLive(record);
       live.record = record;
+      record.stallThresholdMs = this.#stallTimeoutMs;
+      record.stalled = false;
     }
     this.#runs.set(record.runId, live);
 
@@ -556,6 +687,7 @@ export class BridgeDaemon {
       params: { threadId, cwd, resumedFrom: source.runId },
     });
 
+    const unscopedActivityBaseline = live.unscopedTurnActivityVersion;
     const { turnId } = await appServer.startTurn({
       threadId,
       text: prompt,
@@ -566,8 +698,44 @@ export class BridgeDaemon {
     record.turnId = turnId;
     if (record.state === "starting") record.state = "running";
     this.#save(live);
+    this.#scheduleStallCheck(live);
+
+    if (!(await this.#waitForTurnActivity(live, turnId, unscopedActivityBaseline))) {
+      const reason = isTerminal(record.state) && record.error
+        ? `resume turn failed before activity began: ${record.error}`
+        : `App Server accepted turn/start but no turn activity (turn/started, item event, ` +
+          `server request, or turn/completed) ` +
+          `arrived within ${this.#resumeStartTimeoutMs}ms`;
+      if (!isTerminal(record.state)) {
+        this.#record(live, {
+          atMs: Date.now(),
+          method: "bridge/resumeStartFailed",
+          params: { turnId, timeoutMs: this.#resumeStartTimeoutMs, reason },
+        }, false);
+        this.#transition(live, "failed", { error: reason });
+      }
+      throw new Error(reason);
+    }
 
     return { runId: record.runId, threadId, turnId, resumedFrom: source.runId };
+  }
+
+  #newLive(record: RunRecord): LiveRun {
+    return {
+      record,
+      parked: new Map(),
+      waiters: [],
+      stallTimer: null,
+      turnActivityIds: new Set(),
+      unscopedTurnActivityVersion: 0,
+      turnActivityWaiters: [],
+    };
+  }
+
+  #status(runId: string): RunRecord {
+    const live = this.#runs.get(runId);
+    if (live) this.#refreshStall(live);
+    return this.#requireRecord(runId);
   }
 
   #requireLive(runId: string): LiveRun {
@@ -585,8 +753,8 @@ export class BridgeDaemon {
   }
 
   async #opWait(runId: string, timeoutMs: number): Promise<unknown> {
-    const record = this.#requireRecord(runId);
-    if (isTerminal(record.state) || record.state === "blocked") return record;
+    const record = this.#status(runId);
+    if (isTerminal(record.state) || record.state === "blocked" || record.state === "stalled") return record;
     const live = this.#requireLive(runId);
 
     await new Promise<void>((resolve) => {
@@ -658,6 +826,9 @@ export class BridgeDaemon {
    * whole process with it.
    */
   close(): void {
+    for (const live of this.#runs.values()) {
+      if (live.stallTimer) clearTimeout(live.stallTimer);
+    }
     for (const subscriber of this.#subscribers) subscriber.destroy();
     this.#subscribers.clear();
     this.#appServer?.close();
@@ -669,6 +840,12 @@ export class BridgeDaemon {
     this.close();
     process.exit(0);
   }
+}
+
+function positiveDuration(value: number | string, label: string): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) throw new Error(`${label} must be a positive number of milliseconds`);
+  return parsed;
 }
 
 function extractFinalMessage(turn: Record<string, unknown> | undefined): string | null {

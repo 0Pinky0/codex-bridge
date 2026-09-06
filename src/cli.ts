@@ -322,11 +322,11 @@ async function main(): Promise<void> {
           `Policy kinds: ${POLICY_KINDS.join(", ")}`,
           `Policy modes: ${POLICY_MODES.join(", ")} (default: ask)`,
           "",
-          "Exit codes: 0 completed, 10 BLOCKED (needs a human), 11 still running,",
-          "            12 failed, 13 interrupted, 14 daemon unreachable.",
+          "Exit codes: 0 completed, 2 usage, 10 BLOCKED (needs a human),",
+          "            11 still running, 12 failed, 13 interrupted,",
+          "            14 daemon unreachable, 15 STALLED (no event activity).",
           "",
-          "A blocked run is never reported as success. That distinction is the",
-          "reason this tool exists.",
+          "A blocked or stalled run is never reported as success.",
         ].join("\n") + "\n",
       );
       return;

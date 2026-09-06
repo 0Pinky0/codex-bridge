@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BridgeClient, BridgeRequestError } from "../dist/client.js";
 import { BridgeDaemon } from "../dist/daemon.js";
-import { RunStore, needsHuman } from "../dist/run.js";
+import { RunStore, needsHuman, newRunRecord } from "../dist/run.js";
 import { EXIT, exitCodeForRun } from "../dist/outcome.js";
 
 /**
@@ -24,9 +24,9 @@ const FAKE_APP_SERVER = fileURLToPath(new URL("./fixtures/fake-app-server.mjs", 
 let socketCounter = 0;
 
 /** Run `fn` against a started daemon, cleaning up even if it throws. */
-async function withDaemon(home, fn) {
+async function withDaemon(home, fn, options = {}) {
   const socketPath = join(tmpdir(), `cbr-test-${process.pid}-${socketCounter++}.sock`);
-  const daemon = new BridgeDaemon({ home, socketPath, codexPath: FAKE_APP_SERVER });
+  const daemon = new BridgeDaemon({ home, socketPath, codexPath: FAKE_APP_SERVER, ...options });
   await daemon.start();
   const client = new BridgeClient(socketPath);
   try {
@@ -420,6 +420,90 @@ test("a broken event log degrades one run instead of killing the daemon", async 
       const record = await client.send({ op: "wait", runId: healthy.runId, timeoutMs: 5000 }, 10000);
       assert.equal(record.state, "completed");
       assert.equal(record.storeError, null);
+    });
+  });
+});
+
+test("a running run whose real event stream freezes is reported stalled", async () => {
+  await withHome(async (home) => {
+    await withDaemon(home, async (client) => {
+      const { runId } = await dispatch(client, { prompt: "hang" });
+      await new Promise((resolve) => setTimeout(resolve, 120));
+
+      const record = await client.send({ op: "status", runId });
+      assert.equal(record.state, "stalled");
+      assert.equal(record.stalled, true);
+      assert.ok(record.lastEventAtMs <= Date.now() - 80);
+      const events = await client.send({ op: "events", runId, since: 0, limit: 200 });
+      assert.ok(events.some((event) => event.method === "bridge/stalled"));
+    }, { stallTimeoutMs: 80 });
+  });
+});
+
+test("a slow run with continuing App Server events is not reported stalled", async () => {
+  await withHome(async (home) => {
+    await withDaemon(home, async (client) => {
+      const { runId } = await dispatch(client, { prompt: "slow-alive" });
+      await new Promise((resolve) => setTimeout(resolve, 180));
+      const active = await client.send({ op: "status", runId });
+      assert.equal(active.state, "running");
+      assert.equal(active.stalled, false);
+      const done = await client.send({ op: "wait", runId, timeoutMs: 1000 }, 3000);
+      assert.equal(done.state, "completed");
+    }, { stallTimeoutMs: 100 });
+  });
+});
+
+test("resume fails loudly when the accepted turn produces no start activity", async () => {
+  await withHome(async (home) => {
+    await withDaemon(home, async (client) => {
+      const first = await dispatch(client, { prompt: "ok:first" });
+      await client.send({ op: "wait", runId: first.runId, timeoutMs: 1000 }, 3000);
+      await assert.rejects(
+        () => client.send({ op: "resume", runId: first.runId, prompt: "no-start" }, 3000),
+        /accepted turn\/start but no turn activity.*within 80ms/i,
+      );
+      const record = await client.send({ op: "status", runId: first.runId });
+      assert.equal(record.state, "failed");
+      assert.match(record.error, /no turn activity/i);
+    }, { resumeStartTimeoutMs: 80, stallTimeoutMs: 1000 });
+  });
+});
+
+test("a collab wait with no receivers adds a diagnostic warning without failing", async () => {
+  await withHome(async (home) => {
+    await withDaemon(home, async (client) => {
+      const { runId } = await dispatch(client, { prompt: "empty-wait" });
+      const record = await client.send({ op: "wait", runId, timeoutMs: 1000 }, 3000);
+      assert.equal(record.state, "completed");
+      assert.equal(record.warnings.length, 1);
+      assert.match(record.warnings[0].message, /waiting on nobody/i);
+      const events = await client.send({ op: "events", runId, since: 0, limit: 200 });
+      const warning = events.find((event) => event.method === "bridge/warning");
+      assert.equal(warning.params.code, "empty_wait_receivers");
+    });
+  });
+});
+
+test("startup reconciles a persisted stalled record as orphaned rather than healthy", async () => {
+  await withHome(async (home) => {
+    const store = new RunStore(home);
+    const stale = newRunRecord("run-stalled-orphan", process.cwd());
+    stale.threadId = "thread-stalled-orphan";
+    stale.state = "stalled";
+    stale.stalled = true;
+    store.create(stale);
+    store.appendEvent(stale, { atMs: 1_000, method: "item/started", params: { fixture: true } });
+    store.save(stale);
+
+    await withDaemon(home, async (client) => {
+      const record = await client.send({ op: "status", runId: stale.runId });
+      assert.equal(record.state, "failed");
+      assert.equal(record.stalled, false);
+      assert.match(record.error, /daemon.*exited while it was 'stalled'/);
+      const events = await client.send({ op: "events", runId: stale.runId, since: 0, limit: 20 });
+      const orphaned = events.find((event) => event.method === "bridge/orphaned");
+      assert.equal(orphaned.params.previousState, "stalled");
     });
   });
 });

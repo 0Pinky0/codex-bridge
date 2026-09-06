@@ -1,6 +1,11 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { defaultHome, defaultSocketPath } from "../dist/daemon.js";
+import {
+  DEFAULT_RESUME_START_TIMEOUT_MS,
+  DEFAULT_STALL_TIMEOUT_MS,
+  defaultHome,
+  defaultSocketPath,
+} from "../dist/daemon.js";
 
 /**
  * Unix domain socket paths are capped by SUN_LEN (108 bytes on Linux), and the
@@ -61,4 +66,10 @@ test("the bridge home is overridable so runs can be isolated", () => {
   withEnv({ CODEX_BRIDGE_HOME: undefined }, () => {
     assert.match(defaultHome(), /\.codex-bridge$/);
   });
+});
+
+test("liveness defaults leave headroom above a nine-minute silent command", () => {
+  assert.equal(DEFAULT_STALL_TIMEOUT_MS, 900_000);
+  assert.ok(DEFAULT_STALL_TIMEOUT_MS > 9 * 60_000);
+  assert.equal(DEFAULT_RESUME_START_TIMEOUT_MS, 10_000);
 });

@@ -26,10 +26,10 @@ function runCli(args, env = process.env) {
   });
 }
 
-async function withDaemon(fn) {
+async function withDaemon(fn, options = {}) {
   const home = mkdtempSync(join(tmpdir(), "cbr-cli-home-"));
   const socketPath = join(tmpdir(), `cbr-cli-${process.pid}-${Date.now()}.sock`);
-  const daemon = new BridgeDaemon({ home, socketPath, codexPath: FAKE_APP_SERVER });
+  const daemon = new BridgeDaemon({ home, socketPath, codexPath: FAKE_APP_SERVER, ...options });
   await daemon.start();
   const client = new BridgeClient(socketPath);
   try {
@@ -213,4 +213,21 @@ test("daemon stop can explicitly target and clean up a custom socket", async () 
     if (daemon.exitCode === null && daemon.signalCode === null) daemon.kill("SIGTERM");
     rmSync(home, { recursive: true, force: true });
   }
+});
+
+test("watch returns promptly with the stalled exit code", async () => {
+  await withDaemon(async (client, socketPath) => {
+    const { runId } = await client.send({ op: "dispatch", cwd: process.cwd(), prompt: "hang" });
+    const startedAt = Date.now();
+    const safetyInterrupt = setTimeout(() => {
+      void client.send({ op: "interrupt", runId }).catch(() => {});
+    }, 600);
+    const result = await runCli(["watch", runId, "--timeout", "1000", "--socket", socketPath]);
+    clearTimeout(safetyInterrupt);
+    assert.equal(result.code, EXIT.STALLED, result.stderr);
+    assert.ok(Date.now() - startedAt < 500, "watch did not wake promptly on the stall");
+    assert.equal(JSON.parse(result.stdout).state, "stalled");
+    assert.match(result.stderr, /STALLED/);
+    assert.doesNotMatch(result.stderr, /success|completed/i);
+  }, { stallTimeoutMs: 80 });
 });

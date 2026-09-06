@@ -44,6 +44,8 @@ const RUN_OUTPUT_SHAPE = {
   state: z.string(),
   /** True exactly when the run is stopped waiting for a person. */
   needsHuman: z.boolean(),
+  /** True exactly when event activity exceeded the configured liveness threshold. */
+  stalled: z.boolean(),
   /** Heuristic only: a completed final message may be asking for a response. */
   proseQuestionHint: z.boolean(),
   /** True when `codex_wait` returned before the run settled. */
@@ -114,7 +116,8 @@ export function createMcpServer(options: McpServerOptions): McpServer {
         "question instead of finishing: whenever a result reports state " +
         "'blocked' or needsHuman=true, the run is waiting on a person and will " +
         "make no further progress until codex_answer is called. Never report " +
-        "such a run as done.",
+        "such a run as done. A run with state 'stalled' or stalled=true has " +
+        "exceeded its event inactivity threshold and is not healthy or complete.",
     },
   );
 
@@ -217,8 +220,9 @@ export function createMcpServer(options: McpServerOptions): McpServer {
     {
       title: "Wait for a run to settle or block",
       description:
-        `Wait until the run completes, fails, is interrupted, or blocks on a ` +
-        `question. Bounded (default ${DEFAULT_WAIT_MS}ms, max ${MAX_WAIT_MS}ms): if the window ` +
+        `Wait until the run completes, fails, is interrupted, blocks on a ` +
+        `question, or stalls without event activity. ` +
+        `Bounded (default ${DEFAULT_WAIT_MS}ms, max ${MAX_WAIT_MS}ms): if the window ` +
         `elapses first, the result reports the run as still running with ` +
         `timedOut=true. That is not a completion -- call this again.`,
       inputSchema: {
@@ -276,7 +280,7 @@ export function createMcpServer(options: McpServerOptions): McpServer {
         "and have been waiting on a human.",
       inputSchema: {
         state: z
-          .enum(["starting", "running", "blocked", "completed", "failed", "interrupted"])
+          .enum(["starting", "running", "blocked", "stalled", "completed", "failed", "interrupted"])
           .optional()
           .describe("Filter to one state."),
       },
@@ -285,17 +289,20 @@ export function createMcpServer(options: McpServerOptions): McpServer {
       const records = (await call({ op: "list" })) as RunRecord[];
       const filtered = args.state ? records.filter((record) => record.state === args.state) : records;
       const blocked = filtered.filter((record) => needsHuman(record.state));
+      const stalled = filtered.filter((record) => record.stalled);
       return jsonResult({
         runs: filtered.map((record) => ({
           runId: record.runId,
           state: record.state,
           needsHuman: needsHuman(record.state),
+          stalled: record.stalled,
           proseQuestionHint: record.proseQuestionHint,
           cwd: record.cwd,
           updatedAtMs: record.updatedAtMs,
           pending: record.pending.map((p) => ({ requestId: p.requestId, kind: p.kind, summary: p.summary })),
         })),
         blockedCount: blocked.length,
+        stalledCount: stalled.length,
       });
     },
   );
