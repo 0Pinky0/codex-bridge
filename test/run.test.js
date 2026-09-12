@@ -52,6 +52,9 @@ test("every state maps to its documented exit code without changing existing mea
   assert.equal(codes.stalled, 15);
   assert.equal(EXIT.USAGE, 2);
   assert.equal(EXIT.UNREACHABLE, 14);
+  assert.equal(EXIT.HEARTBEAT, 16);
+  assert.notEqual(EXIT.HEARTBEAT, EXIT.STILL_RUNNING);
+  assert.notEqual(EXIT.HEARTBEAT, EXIT.OK);
   const nonSuccess = Object.entries(codes).filter(([state]) => state !== "completed");
   for (const [state, code] of nonSuccess) assert.notEqual(code, 0, `${state} must not look like success`);
 });

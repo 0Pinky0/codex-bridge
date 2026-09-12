@@ -25,6 +25,8 @@ export const EXIT = {
   INTERRUPTED: 13,
   UNREACHABLE: 14,
   STALLED: 15,
+  /** Aggregate watch window elapsed without a run needing attention. */
+  HEARTBEAT: 16,
 } as const;
 
 export function exitCodeForRun(record: RunRecord): number {
