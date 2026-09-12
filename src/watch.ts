@@ -91,12 +91,15 @@ export async function watchAll(
           if (heartbeat) return { record: null, reason: "heartbeat" };
         }
         await new Promise<void>((resolve) => {
-          wake = resolve;
-          if (
-            notifications.length > 0 ||
-            disconnected ||
-            (deadline !== null && Date.now() >= deadline)
-          ) resolve();
+          let timer: NodeJS.Timeout | undefined;
+          const finish = (): void => {
+            if (timer) clearTimeout(timer);
+            if (wake === finish) wake = undefined;
+            resolve();
+          };
+          wake = finish;
+          if (deadline !== null) timer = setTimeout(finish, Math.max(0, deadline - Date.now()));
+          if (notifications.length > 0 || disconnected || (deadline !== null && Date.now() >= deadline)) finish();
         });
         wake = undefined;
       }
