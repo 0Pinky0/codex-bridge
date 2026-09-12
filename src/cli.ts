@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { fileURLToPath } from "node:url";
 import { BridgeClient, BridgeRequestError } from "./client.js";
-import { BridgeDaemon, defaultHome, defaultSocketPath } from "./daemon.js";
+import { BridgeDaemon, defaultHome, defaultSocketPath, requireAbsoluteSocketPath } from "./daemon.js";
 import { parsePolicySpecs, POLICY_KINDS, POLICY_MODES, type InteractionPolicy, type PolicyMode } from "./interaction.js";
 import { EXIT, exitCodeForRun, summarize, summarizeAggregateIdle } from "./outcome.js";
 import type { RunRecord } from "./run.js";
@@ -75,7 +75,9 @@ const ENTRYPOINT = fileURLToPath(import.meta.url);
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   const { command, positional, flags } = args;
-  const socketPath = typeof flags["socket"] === "string" ? flags["socket"] : defaultSocketPath();
+  const socketPath = typeof flags["socket"] === "string"
+    ? requireAbsoluteSocketPath(flags["socket"] as string, "--socket")
+    : defaultSocketPath();
   const client = new BridgeClient(socketPath);
 
   /** Wait on a run and exit with the code that describes what happened. */

@@ -53,9 +53,23 @@ test("a short XDG_RUNTIME_DIR is honoured", () => {
   });
 });
 
+test("a relative XDG_RUNTIME_DIR cannot place the socket in the working directory", () => {
+  withEnv({ CODEX_BRIDGE_SOCKET: undefined, XDG_RUNTIME_DIR: "." }, () => {
+    const path = defaultSocketPath();
+    assert.ok(path.startsWith("/tmp/"), `relative runtime dir must fall back to /tmp: ${path}`);
+    assert.ok(path.startsWith("/"), `socket path must be absolute: ${path}`);
+  });
+});
+
 test("an explicit socket override wins", () => {
   withEnv({ CODEX_BRIDGE_SOCKET: "/tmp/custom.sock" }, () => {
     assert.equal(defaultSocketPath(), "/tmp/custom.sock");
+  });
+});
+
+test("a relative socket override is rejected instead of creating a socket in cwd", () => {
+  withEnv({ CODEX_BRIDGE_SOCKET: "control.sock" }, () => {
+    assert.throws(() => defaultSocketPath(), /must be an absolute path/);
   });
 });
 

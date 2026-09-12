@@ -1,7 +1,7 @@
 import { createServer, type Socket } from "node:net";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { AppServer } from "./appserver.js";
 import type { JsonRpcId } from "./jsonrpc.js";
 import {
@@ -60,11 +60,18 @@ export function defaultHome(): string {
  */
 export function defaultSocketPath(): string {
   const override = process.env["CODEX_BRIDGE_SOCKET"];
-  if (override) return override;
   const uid = typeof userInfo().uid === "number" ? userInfo().uid : 0;
+  if (override) {
+    return requireAbsoluteSocketPath(override, "CODEX_BRIDGE_SOCKET");
+  }
   const runtimeDir = process.env["XDG_RUNTIME_DIR"];
-  const base = runtimeDir && runtimeDir.length < 60 ? runtimeDir : "/tmp";
+  const base = runtimeDir && isAbsolute(runtimeDir) && runtimeDir.length < 60 ? runtimeDir : "/tmp";
   return join(base, `codex-bridge-${uid}`, "control.sock");
+}
+
+export function requireAbsoluteSocketPath(path: string, label = "socket path"): string {
+  if (!isAbsolute(path)) throw new Error(`${label} must be an absolute path`);
+  return path;
 }
 
 interface LiveRun {
@@ -95,7 +102,9 @@ export class BridgeDaemon {
 
   constructor(options: DaemonOptions = {}) {
     this.#store = new RunStore(options.home ?? defaultHome());
-    this.#socketPath = options.socketPath ?? defaultSocketPath();
+    this.#socketPath = options.socketPath
+      ? requireAbsoluteSocketPath(options.socketPath)
+      : defaultSocketPath();
     this.#codexPath = options.codexPath ?? process.env["CODEX_BIN"] ?? "codex";
     this.#policy = options.defaultPolicy ?? {};
     this.#stallTimeoutMs = positiveDuration(

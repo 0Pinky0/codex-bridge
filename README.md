@@ -235,9 +235,10 @@ startup snapshot exits **16** with "no in-flight runs; nothing to report". This
 is deliberately distinct from exit 0, which means a run completed. The flag
 must be a positive number of milliseconds.
 
-When consuming exit codes from a shell, preserve the watch process's status;
-for example, `watch --all; echo "$?"` reports the `echo` command's status to a
-caller rather than the watcher's status.
+When a shell script must expose the watcher's exit code, make `watch` the final
+command in that script. In `watch --all; echo "$?"`, `echo` prints the status
+saved from `watch`, but the shell reports `echo`'s own successful exit (0) to
+the caller, so the watcher's status is lost.
 
 ### Exit codes are the contract
 
@@ -273,6 +274,12 @@ codex-bridge answer <runId> --request 0 --answer approve-session
 codex-bridge answer <runId> --request 0 --answer decline
 codex-bridge answer <runId> --request 2 --answer '{"q1": ["us-east-1"]}'   # requestUserInput
 ```
+
+If the App Server cancels or replaces a parked request, the upstream may remove
+that request without a `codex-bridge answer` call. The bridge records and
+reports requests while they exist, but consumers must not assume a pending
+entry disappears only because a human answered it; refresh `status` after an
+upstream cancellation.
 
 `codex-bridge` will **not** synthesize an approval it cannot express. Permission
 grants and dynamic tool results can only be declined, because inventing them
@@ -344,7 +351,8 @@ Unix domain socket paths are capped at 108 bytes, and the failure is a bare
 `path must be shorter than SUN_LEN` that reads like a permissions problem. The
 control socket therefore lives at `$XDG_RUNTIME_DIR/codex-bridge-<uid>/control.sock`
 — falling back to `/tmp` when the runtime dir is itself long — and never under
-the (long) bridge home. Override with `CODEX_BRIDGE_SOCKET`.
+the (long) bridge home. Relative runtime directories and socket overrides are
+rejected or fall back to `/tmp`; override with an absolute `CODEX_BRIDGE_SOCKET`.
 
 A daemon on a custom socket is intentionally not auto-stopped when idle: it may
 own a blocked run indefinitely. Stop it explicitly with `codex-bridge daemon
@@ -383,6 +391,12 @@ create user namespaces.
   neither answers nor fails the turn on its own.
 
 ## Environment
+
+`npm run ci` runs its checks through `scripts/ci.sh`. That entrypoint creates
+temporary directories outside the checkout and overrides `TMPDIR`,
+`NODE_COMPILE_CACHE`, and npm's cache for every child process. This keeps a
+caller-supplied value such as `TMPDIR=.` from depositing test or compiler
+artifacts in the repository.
 
 | variable | meaning |
 | --- | --- |

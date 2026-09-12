@@ -11,3 +11,4 @@ cbr-custom-home-*/
 codex-bridge-test-*/
 node-compile-cache/
 tmp/
+*.sock
