@@ -116,6 +116,42 @@ test("transitions to every terminal state are pushed to subscribers", async () =
   }
 });
 
+test("a recoverable App Server error remains running and is visible as a warning", async () => {
+  await withHome(async (home) => {
+    await withDaemon(home, async (client) => {
+      const { runId } = await dispatch(client, { prompt: "retry-error" });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      const record = await client.send({ op: "status", runId });
+      assert.equal(record.state, "running");
+      assert.equal(record.warnings[0].code, "app_server_retrying");
+      const events = await client.send({ op: "events", runId, since: 0, limit: 100 });
+      assert.ok(events.some((event) => event.method === "bridge/warning"));
+    });
+  });
+});
+
+test("a non-retryable App Server error still fails the run", async () => {
+  await withHome(async (home) => {
+    await withDaemon(home, async (client) => {
+      const { runId } = await dispatch(client, { prompt: "fatal-error" });
+      const result = await client.send({ op: "wait", runId, timeoutMs: 1000 });
+      assert.equal(result.state, "failed");
+      assert.match(result.error, /willRetry/);
+    });
+  });
+});
+
+test("a retry with no subsequent events is exposed as stalled", async () => {
+  await withHome(async (home) => {
+    await withDaemon(home, async (client) => {
+      const { runId } = await dispatch(client, { prompt: "retry-error" });
+      const result = await client.send({ op: "wait", runId, timeoutMs: 1000 });
+      assert.equal(result.state, "stalled");
+      assert.equal(result.stalled, true);
+    }, { stallTimeoutMs: 60 });
+  });
+});
+
 test("a run completes and the daemon keeps serving when no notification client is listening", async () => {
   await withHome(async (home) => {
     await withDaemon(home, async (client) => {

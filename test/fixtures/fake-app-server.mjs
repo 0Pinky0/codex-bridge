@@ -152,6 +152,26 @@ async function runTurn(threadId, prompt) {
     return;
   }
   if (prompt === "hang") return;
+  if (prompt === "retry-error") {
+    notify("error", {
+      threadId,
+      turnId: threads.get(threadId)?.turnId,
+      error: { responseStreamDisconnected: { httpStatusCode: null } },
+      message: "Reconnecting... 1/5",
+      willRetry: true,
+    });
+    return;
+  }
+  if (prompt === "fatal-error") {
+    notify("error", {
+      threadId,
+      turnId: threads.get(threadId)?.turnId,
+      error: { responseStreamDisconnected: { httpStatusCode: null } },
+      message: "no retries left",
+      willRetry: false,
+    });
+    return;
+  }
   if (prompt === "slow-alive") {
     let sequence = 0;
     const timer = setInterval(() => {

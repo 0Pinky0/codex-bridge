@@ -251,7 +251,19 @@ export class BridgeDaemon {
         break;
       }
       case "error": {
-        this.#transition(live, "failed", { error: JSON.stringify(params).slice(0, 800) });
+        const errorRecord = params as Record<string, unknown> | null;
+        if (errorRecord?.["willRetry"] === true) {
+          const warning = {
+            code: "app_server_retrying",
+            message: `App Server reported a recoverable error and will retry: ${JSON.stringify(errorRecord["error"] ?? errorRecord).slice(0, 600)}`,
+            atMs: Date.now(),
+          };
+          live.record.warnings.push(warning);
+          this.#record(live, { atMs: warning.atMs, method: "bridge/warning", params: warning }, false);
+          this.#transition(live, "running", {});
+        } else {
+          this.#transition(live, "failed", { error: JSON.stringify(params).slice(0, 800) });
+        }
         break;
       }
       default:

@@ -13,6 +13,7 @@ case "$ci_tmp:$ci_node_cache:$ci_npm_cache" in
   *) exit 70 ;;
 esac
 cleanup() {
+  sh scripts/ci-clean.sh
   rm -rf -- "$ci_tmp" "$ci_node_cache" "$ci_npm_cache"
 }
 trap cleanup EXIT HUP INT TERM
