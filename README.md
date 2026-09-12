@@ -82,6 +82,7 @@ codex-bridge resume <runId> --prompt '...' [--new-run] [--wait] [--timeout ms]
 codex-bridge status <runId>
 codex-bridge wait <runId> [--timeout ms]
 codex-bridge watch <runId> [--timeout ms] [--retry-unreachable ms]
+codex-bridge watch --all [--heartbeat ms] [--retry-unreachable ms]
 codex-bridge answer <runId> --request <id> --answer <value|json>
 codex-bridge interrupt <runId>
 codex-bridge list
@@ -219,6 +220,25 @@ reconnects: `watch` never starts a daemon. An already-settled or unknown run
 returns promptly because a daemon response is never retried. The existing
 `wait` and `codex_wait` commands remain bounded and fail fast on an outage.
 
+For coverage across every live run, use `watch --all`. It subscribes to the
+daemon's state-transition stream and takes a startup snapshot, so a run that
+settles during setup is still observed. The first line names the run that
+caused exit and uses the same summary as `watch <runId>`. When several runs have
+settled together, the selected outcome follows this precedence:
+`BLOCKED > STALLED > FAILED > INTERRUPTED > OK`; the run id breaks ties within
+an outcome. `watch --all` never starts a daemon and uses the same
+`--retry-unreachable` outage window as the single-run watcher.
+
+`--heartbeat <ms>` is opt-in. If the interval elapses without a settled run,
+`watch --all` exits **16** and reports a heartbeat. With no heartbeat, an empty
+startup snapshot exits **16** with "no in-flight runs; nothing to report". This
+is deliberately distinct from exit 0, which means a run completed. The flag
+must be a positive number of milliseconds.
+
+When consuming exit codes from a shell, preserve the watch process's status;
+for example, `watch --all; echo "$?"` reports the `echo` command's status to a
+caller rather than the watcher's status.
+
 ### Exit codes are the contract
 
 | code | meaning |
@@ -231,6 +251,7 @@ returns promptly because a daemon response is never retried. The existing
 | 13 | interrupted |
 | 14 | daemon unreachable |
 | **15** | **STALLED — no event activity beyond the configured threshold** |
+| **16** | **aggregate heartbeat or no in-flight runs — nothing to report** |
 
 A caller that only checks for exit 0 still will not mistake a blocked or stalled
 run for a finished one. A caller that reads the code learns exactly what
