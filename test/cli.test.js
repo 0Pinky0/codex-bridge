@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert";
 import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,6 +12,7 @@ import { EXIT } from "../dist/outcome.js";
 
 const CLI = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
 const FAKE_APP_SERVER = fileURLToPath(new URL("./fixtures/fake-app-server.mjs", import.meta.url));
+let cliSocketCounter = 0;
 
 function runCli(args, env = process.env) {
   return new Promise((resolve, reject) => {
@@ -28,7 +30,7 @@ function runCli(args, env = process.env) {
 
 async function withDaemon(fn, options = {}) {
   const home = mkdtempSync(join(tmpdir(), "cbr-cli-home-"));
-  const socketPath = join(tmpdir(), `cbr-cli-${process.pid}-${Date.now()}.sock`);
+  const socketPath = join(tmpdir(), `cbr-cli-${process.pid}-${cliSocketCounter++}.sock`);
   const daemon = new BridgeDaemon({ home, socketPath, codexPath: FAKE_APP_SERVER, ...options });
   await daemon.start();
   const client = new BridgeClient(socketPath);
@@ -36,7 +38,7 @@ async function withDaemon(fn, options = {}) {
     await fn(client, socketPath);
   } finally {
     daemon.close();
-    rmSync(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 }
 
@@ -140,7 +142,7 @@ test("watch survives daemon stop/start and reports the orphaned run", async () =
       assert.equal(await client.isRunning(), false, "restarted test daemon did not stop");
     }
     if (daemon.exitCode === null && daemon.signalCode === null) daemon.kill("SIGTERM");
-    rmSync(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -211,7 +213,7 @@ test("daemon stop can explicitly target and clean up a custom socket", async () 
     assert.equal(await client.isRunning(), false);
   } finally {
     if (daemon.exitCode === null && daemon.signalCode === null) daemon.kill("SIGTERM");
-    rmSync(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -230,4 +232,34 @@ test("watch returns promptly with the stalled exit code", async () => {
     assert.match(result.stderr, /STALLED/);
     assert.doesNotMatch(result.stderr, /success|completed/i);
   }, { stallTimeoutMs: 80 });
+});
+
+test("watch --all exits with the blocked run summary as its first line", async () => {
+  await withDaemon(async (client, socketPath) => {
+    const { runId } = await client.send({ op: "dispatch", cwd: process.cwd(), prompt: "approve:touch marker" });
+    const blocked = await client.send({ op: "wait", runId, timeoutMs: 5000 }, 10000);
+    assert.equal(blocked.state, "blocked");
+    const result = await runCli(["watch", "--all", "--socket", socketPath]);
+    assert.equal(result.code, EXIT.BLOCKED);
+    assert.match(result.stdout.split("\n", 1)[0], new RegExp(`^run ${runId} is BLOCKED`));
+    assert.equal(JSON.parse(result.stdout.split("\n").slice(1).join("\n")).runId, runId);
+  });
+});
+
+test("watch --all returns the heartbeat code when enabled", async () => {
+  await withDaemon(async (client, socketPath) => {
+    await client.send({ op: "dispatch", cwd: process.cwd(), prompt: "hang" });
+    const result = await runCli(["watch", "--all", "--heartbeat", "80", "--socket", socketPath]);
+    assert.equal(result.code, EXIT.HEARTBEAT);
+    assert.match(result.stdout, /HEARTBEAT/);
+  });
+});
+
+test("watch --all reports no in-flight runs with the heartbeat code", async () => {
+  await withDaemon(async (_client, socketPath) => {
+    const result = await runCli(["watch", "--all", "--socket", socketPath]);
+    assert.equal(result.code, EXIT.HEARTBEAT);
+    assert.match(result.stdout.split("\n", 1)[0], /no in-flight runs/);
+    assert.doesNotMatch(result.stdout, /completed/);
+  });
 });

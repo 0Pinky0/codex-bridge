@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import { mkdtempSync, rmSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -48,7 +49,8 @@ function withHome(fn) {
     } finally {
       if (saved === undefined) delete process.env.FAKE_APP_SERVER_STATE;
       else process.env.FAKE_APP_SERVER_STATE = saved;
-      rmSync(home, { recursive: true, force: true });
+      // Let closing daemon children release files before retrying busy workspace paths.
+      await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   })();
 }

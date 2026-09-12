@@ -3,8 +3,9 @@ import { fileURLToPath } from "node:url";
 import { BridgeClient, BridgeRequestError } from "./client.js";
 import { BridgeDaemon, defaultHome, defaultSocketPath } from "./daemon.js";
 import { parsePolicySpecs, POLICY_KINDS, POLICY_MODES, type InteractionPolicy, type PolicyMode } from "./interaction.js";
-import { EXIT, exitCodeForRun, summarize } from "./outcome.js";
+import { EXIT, exitCodeForRun, summarize, summarizeAggregateIdle } from "./outcome.js";
 import type { RunRecord } from "./run.js";
+import { watchAll } from "./watch.js";
 
 export { EXIT } from "./outcome.js";
 
@@ -244,6 +245,34 @@ async function main(): Promise<void> {
     }
 
     case "watch": {
+      if (flags["all"] !== undefined) {
+        if (flags["all"] !== true || positional.length > 0) fail("watch --all cannot take a run id");
+        for (const name of ["heartbeat", "retry-unreachable"]) {
+          if (flags[name] !== undefined && typeof flags[name] !== "string") {
+            fail(`--${name} requires a number of milliseconds`);
+          }
+        }
+        const heartbeatMs = flags["heartbeat"] === undefined ? undefined : Number(flags["heartbeat"]);
+        if (heartbeatMs !== undefined && (!Number.isFinite(heartbeatMs) || heartbeatMs <= 0)) {
+          fail("--heartbeat must be a positive number of milliseconds");
+        }
+        const retryUnreachableMs = Number(flags["retry-unreachable"] ?? 300000);
+        if (!Number.isFinite(retryUnreachableMs) || retryUnreachableMs < 0) {
+          fail("--retry-unreachable must be a non-negative number of milliseconds");
+        }
+        const result = await watchAll(client, { heartbeatMs, retryUnreachableMs });
+        if (result.record) {
+          // Keep stdout line-oriented: the first line names the run/reason,
+          // followed by the machine-readable record. Full blocked guidance is
+          // retained on stderr, matching single-run watch.
+          process.stdout.write(summarize(result.record).split("\n", 1)[0] + "\n");
+          print(result.record);
+          process.stderr.write(summarize(result.record) + "\n");
+          process.exit(exitCodeForRun(result.record));
+        }
+        process.stdout.write(summarizeAggregateIdle(result.reason) + "\n");
+        process.exit(EXIT.HEARTBEAT);
+      }
       const runId = positional[0];
       if (!runId) fail("watch requires a run id");
       await watchAndExit(runId);
@@ -313,6 +342,8 @@ async function main(): Promise<void> {
           "  wait <runId> [--timeout ms]",
           "  watch <runId> [--timeout ms] [--retry-unreachable ms]",
           "        wait across bounded windows; retry unreachable daemons for 300000ms",
+          "  watch --all [--heartbeat ms] [--retry-unreachable ms]",
+          "        watch every in-flight run; heartbeat is off by default",
           "  answer <runId> --request <id> --answer <value|json>",
           "  interrupt <runId>",
           "  list",
@@ -324,7 +355,8 @@ async function main(): Promise<void> {
           "",
           "Exit codes: 0 completed, 2 usage, 10 BLOCKED (needs a human),",
           "            11 still running, 12 failed, 13 interrupted,",
-          "            14 daemon unreachable, 15 STALLED (no event activity).",
+          "            14 daemon unreachable, 15 STALLED (no event activity),",
+          "            16 heartbeat / no in-flight runs (nothing to report).",
           "",
           "A blocked or stalled run is never reported as success.",
         ].join("\n") + "\n",

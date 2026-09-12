@@ -106,36 +106,42 @@ export class BridgeClient {
    * The returned function only closes this disposable client connection. The
    * daemon never waits for a subscriber, and losing one cannot affect a run.
    */
-  subscribe(onNotification: (notification: RunStateNotification) => void, timeoutMs = 3000): Promise<() => void> {
+  subscribe(
+    onNotification: (notification: RunStateNotification) => void,
+    timeoutMs = 3000,
+    onDisconnect?: (error: BridgeRequestError) => void,
+  ): Promise<() => void> {
     return new Promise((resolve, reject) => {
       const socket = connect(this.#socketPath);
       let buffer = "";
       let subscribed = false;
-      let settled = false;
+      let closed = false;
 
       const timer = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        socket.destroy();
-        reject(new BridgeRequestError(`control subscription timed out after ${timeoutMs}ms`, true));
+        fail(new BridgeRequestError(`control subscription timed out after ${timeoutMs}ms`, true));
       }, timeoutMs);
 
-      const failBeforeSubscribe = (message: string): void => {
-        if (settled || subscribed) return;
-        settled = true;
+      const fail = (error: BridgeRequestError): void => {
+        if (closed) return;
+        closed = true;
         clearTimeout(timer);
-        reject(new BridgeRequestError(message, true));
+        socket.destroy();
+        if (subscribed) onDisconnect?.(error);
+        else reject(error);
       };
 
       socket.setEncoding("utf8");
       socket.on("error", (error) =>
-        failBeforeSubscribe(`cannot subscribe to codex-bridge daemon at ${this.#socketPath}: ${error.message}`),
+        fail(new BridgeRequestError(`cannot subscribe to codex-bridge daemon at ${this.#socketPath}: ${error.message}`, true)),
       );
-      socket.on("close", () => failBeforeSubscribe("daemon closed the subscription before acknowledging it"));
+      socket.on("close", () => fail(new BridgeRequestError(
+        subscribed ? "daemon closed the subscription" : "daemon closed the subscription before acknowledging it",
+        true,
+      )));
       socket.on("connect", () => socket.write(JSON.stringify({ op: "subscribe" }) + "\n"));
       socket.on("data", (chunk: string) => {
         buffer += chunk;
-        for (;;) {
+        while (!closed) {
           const index = buffer.indexOf("\n");
           if (index < 0) break;
           const line = buffer.slice(0, index);
@@ -143,20 +149,22 @@ export class BridgeClient {
           let message: Record<string, unknown>;
           try {
             message = JSON.parse(line) as Record<string, unknown>;
+            if (!message || typeof message !== "object") throw new Error("invalid message");
           } catch {
-            failBeforeSubscribe("daemon returned malformed subscription JSON");
-            continue;
+            fail(new BridgeRequestError("daemon returned malformed subscription JSON", true));
+            return;
           }
           if (!subscribed) {
             if (!message["ok"]) {
-              failBeforeSubscribe(String(message["error"] ?? "daemon refused the subscription"));
-              socket.destroy();
-              continue;
+              fail(new BridgeRequestError(String(message["error"] ?? "daemon refused the subscription"), false));
+              return;
             }
             subscribed = true;
-            settled = true;
             clearTimeout(timer);
-            resolve(() => socket.destroy());
+            resolve(() => {
+              closed = true;
+              socket.destroy();
+            });
             continue;
           }
           if (message["notification"] === "run/stateChanged" && typeof message["record"] === "object") {

@@ -46,6 +46,21 @@ export function exitCodeForRun(record: RunRecord): number {
   }
 }
 
+/** Pick the most urgent eligible run; run id breaks ties deterministically. */
+export function selectAggregateRun(records: Iterable<RunRecord>): RunRecord | undefined {
+  const priority: readonly number[] = [EXIT.BLOCKED, EXIT.STALLED, EXIT.FAILED, EXIT.INTERRUPTED, EXIT.OK];
+  return [...records]
+    .filter((record) => exitCodeForRun(record) !== EXIT.STILL_RUNNING)
+    .sort((a, b) => priority.indexOf(exitCodeForRun(a)) - priority.indexOf(exitCodeForRun(b)) ||
+      a.runId.localeCompare(b.runId))[0];
+}
+
+export function summarizeAggregateIdle(reason: "heartbeat" | "no-in-flight-runs"): string {
+  return reason === "no-in-flight-runs"
+    ? "watch --all: no in-flight runs; nothing to report"
+    : "watch --all: HEARTBEAT; no run needs attention";
+}
+
 /** A one-line human summary that never hides a blocked state behind a status word. */
 export function summarize(record: RunRecord): string {
   if (record.state === "blocked") {
