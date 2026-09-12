@@ -15,7 +15,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --test \"test/**/*.test.js\"",
     "regen-protocol": "codex app-server generate-ts --out src/protocol && node scripts/fix-protocol-imports.mjs src/protocol",
-    "ci": "npm run typecheck && npm run build && npm test"
+    "ci": "sh scripts/ci.sh",
+    "postci": "sh scripts/ci-clean.sh"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

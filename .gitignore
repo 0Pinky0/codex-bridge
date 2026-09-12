@@ -3,3 +3,11 @@ dist/
 *.log
 .DS_Store
 .claude/
+cbr-cli-home-*/
+cbr-home-*/
+cbr-watch-restart-home-*/
+cbr-sub-*/
+cbr-custom-home-*/
+codex-bridge-test-*/
+node-compile-cache/
+tmp/
